@@ -1,0 +1,41 @@
+trading:
+  mode: paper  # paper or live
+  initial_balance: 10000
+
+  # Binance Trading pairs with WALRUS/USDC
+  pairs:
+    - WALRUS/USDC  # Primary focus: Walrus token
+    - BTC/USDT     # Optional: Bitcoin for diversification
+    - ETH/USDT     # Optional: Ethereum for diversification
+
+  # Timeframes for analysis
+  # Options: 1m, 5m, 15m, 30m, 1h, 4h, 1d
+  timeframe: 1h
+
+risk_management:
+  max_position_size: 0.1  # 10% of portfolio per trade
+  stop_loss_percentage: 0.02  # 2% stop loss
+  take_profit_percentage: 0.05  # 5% take profit
+  max_daily_loss: 0.05  # 5% max daily loss
+  max_open_positions: 3  # Maximum simultaneous positions
+
+strategy:
+  name: intelligent_momentum
+
+  # Technical indicators optimized for crypto trading
+  indicators:
+    rsi_period: 14
+    rsi_oversold: 30  # Buy signal threshold
+    rsi_overbought: 70  # Sell signal threshold
+
+    ema_short: 9  # Fast EMA for trend detection
+    ema_long: 21  # Slow EMA for trend confirmation
+
+    volume_threshold: 1.5  # Volume must be 1.5x average to confirm moves
+
+  # Confidence thresholds
+  min_confidence: 0.6  # Only trade when confidence > 60%
+
+logging:
+  level: INFO
+  file: logs/trading_bot.log

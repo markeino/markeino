@@ -4,9 +4,9 @@ trading:
 
   # Trading pairs to monitor
   pairs:
+    - WALRUS/USDC
     - BTC/USDT
     - ETH/USDT
-    - SOL/USDT
 
   # Timeframes for analysis
   timeframe: 1h

@@ -11,6 +11,24 @@ An intelligent cryptocurrency trading bot that uses technical analysis and logic
 - **Live Trading**: Support for real trading on crypto exchanges (Binance, etc.)
 - **Comprehensive Logging**: Track all trades, signals, and portfolio performance
 - **Flexible Configuration**: Easy customization via YAML config files
+- **Binance Integration**: Pre-configured for Binance exchange with WALRUS/USDC support
+
+## Quick Start for Binance & WALRUS/USDC
+
+Want to trade WALRUS on Binance? It's already set up!
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run in paper trading mode (simulation - no API keys needed)
+python main.py --config config.binance.yaml
+
+# Or try the WALRUS trading example
+python examples/walrus_trading.py
+```
+
+For detailed Binance setup including live trading, see [BINANCE_SETUP.md](BINANCE_SETUP.md)
 
 ## How It Works
 
