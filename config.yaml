@@ -1,0 +1,40 @@
+trading:
+  mode: paper  # paper or live
+  initial_balance: 10000
+
+  # Trading pairs to monitor
+  pairs:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+
+  # Timeframes for analysis
+  timeframe: 1h
+
+risk_management:
+  max_position_size: 0.1  # 10% of portfolio per trade
+  stop_loss_percentage: 0.02  # 2% stop loss
+  take_profit_percentage: 0.05  # 5% take profit
+  max_daily_loss: 0.05  # 5% max daily loss
+  max_open_positions: 3
+
+strategy:
+  name: intelligent_momentum
+
+  # Technical indicators
+  indicators:
+    rsi_period: 14
+    rsi_oversold: 30
+    rsi_overbought: 70
+
+    ema_short: 9
+    ema_long: 21
+
+    volume_threshold: 1.5  # Volume must be 1.5x average
+
+  # Confidence thresholds
+  min_confidence: 0.6  # Minimum confidence to execute trade
+
+logging:
+  level: INFO
+  file: logs/trading_bot.log
