@@ -1,11 +1,9 @@
 """
 DEX Arbitrage Monitor
-Polls ETH/USDC, WBTC/USDC, and ETH/USDT across 6 DEXes via GraphQL / REST APIs.
+Polls ETH/USDC, WBTC/USDC, and ETH/USDT across 5 DEXes via GraphQL / REST APIs.
 Alerts when fee-adjusted net spread exceeds threshold.
 
-Note: DEX prices update on-chain per block (~12 s on Ethereum, ~3 s on BSC,
-~2 s on Avalanche) — no WebSocket needed. Cross-chain pairs (Trader Joe /
-Avalanche) require bridging before execution; bridge fees are NOT included.
+Note: DEX prices update on-chain per block (~12 s on Ethereum) — no WebSocket needed.
 """
 
 import asyncio
@@ -31,7 +29,6 @@ DEX_FEE_PCT: dict[str, float] = {
     "curve":       0.04,   # tricrypto2 / crypto pools
     "sushiswap":   0.30,   # SushiSwap v2
     "balancer":    0.10,   # Balancer weighted pools (varies; 0.10% common)
-    "trader_joe":  0.30,   # Trader Joe v2.1 Liquidity Book (Avalanche)
 }
 
 # Per-pair fee overrides for specific pool tiers
@@ -53,7 +50,6 @@ DEX_CHAIN = {
     "curve":       "ethereum",
     "sushiswap":   "ethereum",
     "balancer":    "ethereum",
-    "trader_joe":  "avalanche",
 }
 
 # ─── Subgraph / API endpoints & pool identifiers ─────────────────────────────
@@ -95,14 +91,6 @@ _BALANCER_POOLS = {
 # tricrypto2: coins = [USDT(0), WBTC(1), WETH(2)]
 _CURVE_API = "https://api.curve.fi/v1/getPools/ethereum/main"
 _CURVE_POOL = "tricrypto2"
-
-# Trader Joe v2.1 — Avalanche  (WETH.e / USDC.e / USDT.e wrapped equivalents)
-_TRADERJOE_URL = "https://api.thegraph.com/subgraphs/name/traderjoe-xyz/exchange"
-_TRADERJOE_PAIRS = {
-    "ETH/USDC":  "0xa389f9430876455c36478deea9769b7ca4e3ddb1",  # WETH.e/USDC.e
-    "WBTC/USDC": "0x62475f52add016369a2061a5aedc2c8c5b4ac78f",  # WBTC.e/USDC.e
-    "ETH/USDT":  "0xed8cbd9f0ce3c6986b22002f03c6475ceb7a6256",  # WETH.e/USDT.e
-}
 
 # ─── Thresholds ───────────────────────────────────────────────────────────────
 MIN_SPREAD_PCT  = 0.05    # % gross spread to trigger an alert check
@@ -298,27 +286,12 @@ async def fetch_curve(session: aiohttp.ClientSession, pair: str) -> float | None
     return float(usd_prices[idx])
 
 
-async def fetch_trader_joe(session: aiohttp.ClientSession, pair: str) -> float | None:
-    pair_id = _TRADERJOE_PAIRS.get(pair)
-    if not pair_id:
-        return None
-    data = await _graphql(session, _TRADERJOE_URL, _V2_PAIR_QUERY % pair_id)
-    p = data["data"].get("pair")
-    if not p:
-        return None
-    return _price_from_pool(
-        p["token0"]["symbol"], p["token1"]["symbol"],
-        p["token0Price"],      p["token1Price"],
-    )
-
-
 FETCHERS = {
     "uniswap_v3":  fetch_uniswap_v3,
     "pancakeswap": fetch_pancakeswap,
     "curve":       fetch_curve,
     "sushiswap":   fetch_sushiswap,
     "balancer":    fetch_balancer,
-    "trader_joe":  fetch_trader_joe,
 }
 
 # ─── Arbitrage Detection ──────────────────────────────────────────────────────
@@ -369,31 +342,25 @@ def check_arbitrage(pair: str) -> None:
         return
     last_alert[pair] = mono_now
 
-    ts         = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    buy_chain  = DEX_CHAIN.get(min_dex, "?")
-    sell_chain = DEX_CHAIN.get(max_dex, "?")
-    cross      = buy_chain != sell_chain
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
     print(f"\n{'='*64}")
-    print(f"  ARB ALERT  {pair}  [{ts}]{'  ⚠ CROSS-CHAIN' if cross else ''}")
+    print(f"  ARB ALERT  {pair}  [{ts}]")
     print(f"{'='*64}")
-    print(f"  BUY  on {min_dex:<14} ({buy_chain:<10})  price = {buy_price:>12.4f}  fee = {fee_buy:.3f}%")
-    print(f"  SELL on {max_dex:<14} ({sell_chain:<10})  price = {sell_price:>12.4f}  fee = {fee_sell:.3f}%")
+    print(f"  BUY  on {min_dex:<14}  price = {buy_price:>12.4f}  fee = {fee_buy:.3f}%")
+    print(f"  SELL on {max_dex:<14}  price = {sell_price:>12.4f}  fee = {fee_sell:.3f}%")
     print(f"  Gross spread : {gross_pct:>8.4f}%")
     print(f"  Total fees   : {fee_buy + fee_sell:>8.4f}%")
     print(f"  Net spread   : {net_pct:>8.4f}%  {'✓ PROFITABLE' if net_pct > 0 else '✗ fee-negative'}")
     print(f"  Est. profit  : ${profit_usdt:>8.4f}  on ${MIN_TRADE_USDT:,.0f} trade")
-    if cross:
-        print(f"  ⚠  Cross-chain arb: bridge fees & latency must be factored in.")
     print(f"{'='*64}")
 
     print(f"\n  Price snapshot — {pair}:")
-    print(f"  {'DEX':<16} {'Chain':<12} {'Price (USD)':>14} {'Age(s)':>8}")
-    print(f"  {'-'*54}")
+    print(f"  {'DEX':<16} {'Price (USD)':>14} {'Age(s)':>8}")
+    print(f"  {'-'*42}")
     for dex, v in sorted(data.items()):
-        age   = f"{now - v['ts']:.1f}" if v.get("ts") else "—"
-        chain = DEX_CHAIN.get(dex, "?")
-        print(f"  {dex:<16} {chain:<12} {v['price']:>14.4f} {age:>8}")
+        age = f"{now - v['ts']:.1f}" if v.get("ts") else "—"
+        print(f"  {dex:<16} {v['price']:>14.4f} {age:>8}")
     print()
 
     log_alert(ts, pair, min_dex, buy_price, max_dex, sell_price,
@@ -446,12 +413,11 @@ async def status_printer() -> None:
             if not data:
                 continue
             print(f"\n  {pair}")
-            print(f"  {'DEX':<16} {'Chain':<12} {'Price (USD)':>14} {'Age(s)':>8}")
-            print(f"  {'-'*54}")
+            print(f"  {'DEX':<16} {'Price (USD)':>14} {'Age(s)':>8}")
+            print(f"  {'-'*42}")
             for dex, v in sorted(data.items()):
-                age   = f"{now - v['ts']:.1f}" if v.get("ts") else "—"
-                chain = DEX_CHAIN.get(dex, "?")
-                print(f"  {dex:<16} {chain:<12} {v['price']:>14.4f} {age:>8}")
+                age = f"{now - v['ts']:.1f}" if v.get("ts") else "—"
+                print(f"  {dex:<16} {v['price']:>14.4f} {age:>8}")
         print(f"\n{'─'*64}\n")
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
