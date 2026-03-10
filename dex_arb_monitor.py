@@ -52,45 +52,43 @@ DEX_CHAIN = {
     "balancer":    "ethereum",
 }
 
-# ─── Subgraph / API endpoints & pool identifiers ─────────────────────────────
+# ─── Pool addresses (Ethereum mainnet) ───────────────────────────────────────
+# All prices fetched via DexScreener REST API (no API key required).
+# DexScreener endpoint: GET /latest/dex/pairs/ethereum/{address}
 
-# Uniswap v3 — Ethereum mainnet
-_UNISWAP_URL = "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3"
+_DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/pairs/ethereum/{}"
+
 _UNISWAP_POOLS = {
-    # token ordering in pool: lower address = token0
-    "ETH/USDC":  "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",  # USDC(t0)/WETH(t1) 0.05%
-    "WBTC/USDC": "0x99ac8ca7087fa4a2a1fb6357269965a2014abc35",  # WBTC(t0)/USDC(t1) 0.30%
-    "ETH/USDT":  "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36",  # USDT(t0)/WETH(t1) 0.30%
+    "ETH/USDC":  "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",  # USDC/WETH 0.05%
+    "WBTC/USDC": "0x99ac8ca7087fa4a2a1fb6357269965a2014abc35",  # WBTC/USDC 0.30%
+    "ETH/USDT":  "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36",  # USDT/WETH 0.30%
 }
 
-# PancakeSwap v3 — Ethereum mainnet
-_PANCAKE_URL = "https://api.thegraph.com/subgraphs/name/pancakeswap/exchange-v3-eth"
 _PANCAKE_POOLS = {
     "ETH/USDC":  "0x1ac1a8feaaea1900c4166deeed0c11cc10669d36",
     "WBTC/USDC": "0xd9e2a1a61b6e61b275cec326465d417e52c1b95c",
     "ETH/USDT":  "0x6ca298d2983ab03aa1da7679389d955a4efee15c",
 }
 
-# SushiSwap v2 — Ethereum mainnet
-_SUSHI_URL = "https://api.thegraph.com/subgraphs/name/sushiswap/exchange"
 _SUSHI_PAIRS = {
-    "ETH/USDC":  "0x397ff1542f962076d0bfe58ea045ffa2d347aca0",  # USDC(t0)/WETH(t1)
-    "WBTC/USDC": "0xceff51756c56ceffca006cd410b03ffc46dd3a58",  # USDC(t0)/WBTC(t1)
-    "ETH/USDT":  "0x06da0fd433c1a5d7a4faa01111c044910a184553",  # USDT(t0)/WETH(t1)
+    "ETH/USDC":  "0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
+    "WBTC/USDC": "0xceff51756c56ceffca006cd410b03ffc46dd3a58",
+    "ETH/USDT":  "0x06da0fd433c1a5d7a4faa01111c044910a184553",
 }
 
-# Balancer v2 — Ethereum mainnet  (32-byte pool IDs)
-_BALANCER_URL = "https://api.thegraph.com/subgraphs/name/balancer-labs/balancer-v2"
+# Balancer: use first 20 bytes (contract address) of the 32-byte pool ID
 _BALANCER_POOLS = {
-    "ETH/USDC":  "0x96646936b91d6b9d7d0c47c496afbf3d6ec7b6f8000200000000000000000019",
-    "WBTC/USDC": "0x8a819a4cabd6efcb4e5504fe8679a1abd831dd8f0002000000000000000000cd",
-    "ETH/USDT":  "0x3e5fa9518ea95c3e533eb377c001702a9aacaa32000200000000000000000052",
+    "ETH/USDC":  "0x96646936b91d6b9d7d0c47c496afbf3d6ec7b6f",
+    "WBTC/USDC": "0x8a819a4cabd6efcb4e5504fe8679a1abd831dd8f",
+    "ETH/USDT":  "0x3e5fa9518ea95c3e533eb377c001702a9aacaa32",
 }
 
-# Curve — Ethereum mainnet REST API
-# tricrypto2: coins = [USDT(0), WBTC(1), WETH(2)]
-_CURVE_API = "https://api.curve.fi/v1/getPools/ethereum/main"
-_CURVE_POOL = "tricrypto2"
+# Curve tricrypto2 pool address (USDT/WBTC/WETH)
+_CURVE_POOLS = {
+    "ETH/USDC":  "0xd51a44d3fae010294c616388b506acda1bfaae46",
+    "WBTC/USDC": "0xd51a44d3fae010294c616388b506acda1bfaae46",
+    "ETH/USDT":  "0xd51a44d3fae010294c616388b506acda1bfaae46",
+}
 
 # ─── Thresholds ───────────────────────────────────────────────────────────────
 MIN_SPREAD_PCT  = 0.05    # % gross spread to trigger an alert check
@@ -129,161 +127,45 @@ prices: dict[str, dict[str, dict]] = defaultdict(dict)
 last_alert: dict[str, float]       = defaultdict(float)
 last_stale_log: dict[tuple, float] = defaultdict(float)
 
-# ─── Price Normalization Helper ───────────────────────────────────────────────
-_BASE_SYMS = {"WETH", "ETH", "WBTC"}
+# ─── Price Fetchers (DexScreener REST API) ────────────────────────────────────
 
-def _price_from_pool(t0_sym: str, t1_sym: str,
-                     t0_price: str, t1_price: str) -> float | None:
-    """
-    Uniswap-style pools:
-      token0Price = amount of token1 per token0  (token1 / token0)
-      token1Price = amount of token0 per token1  (token0 / token1)
-    We always want USD per base (ETH or WBTC).
-    """
-    t0 = t0_sym.upper()
-    t1 = t1_sym.upper()
-    if t0 in _BASE_SYMS:
-        return float(t0_price)   # USD-equivalent per base
-    if t1 in _BASE_SYMS:
-        return float(t1_price)   # USD-equivalent per base
-    return None
-
-# ─── Price Fetchers ───────────────────────────────────────────────────────────
-_V3_POOL_QUERY = """
-{
-  pool(id: "%s") {
-    token0 { symbol }
-    token1 { symbol }
-    token0Price
-    token1Price
-  }
-}
-"""
-
-_V2_PAIR_QUERY = """
-{
-  pair(id: "%s") {
-    token0 { symbol }
-    token1 { symbol }
-    token0Price
-    token1Price
-  }
-}
-"""
-
-async def _graphql(session: aiohttp.ClientSession, url: str,
-                   query: str) -> dict:
-    async with session.post(url, json={"query": query},
-                            timeout=aiohttp.ClientTimeout(total=10)) as r:
-        return await r.json()
+async def _fetch_dexscreener(session: aiohttp.ClientSession,
+                              pool_address: str) -> float | None:
+    url = _DEXSCREENER_URL.format(pool_address)
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        data = await r.json()
+    pairs = data.get("pairs") or []
+    if not pairs:
+        return None
+    price_str = pairs[0].get("priceUsd")
+    if price_str is None:
+        return None
+    return float(price_str)
 
 
 async def fetch_uniswap_v3(session: aiohttp.ClientSession, pair: str) -> float | None:
-    pool_id = _UNISWAP_POOLS.get(pair)
-    if not pool_id:
-        return None
-    data = await _graphql(session, _UNISWAP_URL, _V3_POOL_QUERY % pool_id)
-    p = data["data"]["pool"]
-    return _price_from_pool(
-        p["token0"]["symbol"], p["token1"]["symbol"],
-        p["token0Price"],      p["token1Price"],
-    )
+    addr = _UNISWAP_POOLS.get(pair)
+    return await _fetch_dexscreener(session, addr) if addr else None
 
 
 async def fetch_pancakeswap(session: aiohttp.ClientSession, pair: str) -> float | None:
-    pool_id = _PANCAKE_POOLS.get(pair)
-    if not pool_id:
-        return None
-    data = await _graphql(session, _PANCAKE_URL, _V3_POOL_QUERY % pool_id)
-    p = data["data"]["pool"]
-    return _price_from_pool(
-        p["token0"]["symbol"], p["token1"]["symbol"],
-        p["token0Price"],      p["token1Price"],
-    )
+    addr = _PANCAKE_POOLS.get(pair)
+    return await _fetch_dexscreener(session, addr) if addr else None
 
 
 async def fetch_sushiswap(session: aiohttp.ClientSession, pair: str) -> float | None:
-    pair_id = _SUSHI_PAIRS.get(pair)
-    if not pair_id:
-        return None
-    data = await _graphql(session, _SUSHI_URL, _V2_PAIR_QUERY % pair_id)
-    p = data["data"]["pair"]
-    return _price_from_pool(
-        p["token0"]["symbol"], p["token1"]["symbol"],
-        p["token0Price"],      p["token1Price"],
-    )
+    addr = _SUSHI_PAIRS.get(pair)
+    return await _fetch_dexscreener(session, addr) if addr else None
 
 
 async def fetch_balancer(session: aiohttp.ClientSession, pair: str) -> float | None:
-    pool_id = _BALANCER_POOLS.get(pair)
-    if not pool_id:
-        return None
-    query = """
-    {
-      pool(id: "%s") {
-        tokens { symbol weight balance }
-      }
-    }
-    """ % pool_id
-    data  = await _graphql(session, _BALANCER_URL, query)
-    tokens = data["data"]["pool"]["tokens"]
-
-    base     = pair.split("/")[0].upper()
-    usd_syms = {"USDC", "USDT", "DAI"}
-
-    base_tok  = next((t for t in tokens if t["symbol"].upper() in _BASE_SYMS
-                      and (base == "ETH" and t["symbol"].upper() in ("WETH", "ETH")
-                           or base == t["symbol"].upper())), None)
-    quote_tok = next((t for t in tokens if t["symbol"].upper() in usd_syms), None)
-
-    if not base_tok or not quote_tok:
-        return None
-
-    b_base  = float(base_tok["balance"])
-    b_quote = float(quote_tok["balance"])
-    w_base  = float(base_tok["weight"])
-    w_quote = float(quote_tok["weight"])
-
-    if b_base == 0 or w_base == 0:
-        return None
-
-    # Balancer weighted AMM spot price: P = (B_quote / W_quote) / (B_base / W_base)
-    return (b_quote / w_quote) / (b_base / w_base)
+    addr = _BALANCER_POOLS.get(pair)
+    return await _fetch_dexscreener(session, addr) if addr else None
 
 
 async def fetch_curve(session: aiohttp.ClientSession, pair: str) -> float | None:
-    """
-    Curve tricrypto2 coins: [USDT(0), WBTC(1), WETH(2)]
-    usdPrices mirrors coins list: [1.0, ~60000, ~3000]
-    """
-    async with session.get(_CURVE_API, timeout=aiohttp.ClientTimeout(total=15)) as r:
-        data = await r.json()
-
-    pool = next(
-        (p for p in data.get("data", {}).get("poolData", [])
-         if p.get("id", "").lower() == _CURVE_POOL.lower()
-         or p.get("name", "").lower().find("tricrypto2") >= 0),
-        None,
-    )
-    if not pool:
-        return None
-
-    coins      = [c["symbol"].upper() for c in pool.get("coins", [])]
-    usd_prices = pool.get("usdPrices", [])
-    if not usd_prices:
-        return None
-
-    base = pair.split("/")[0].upper()
-    if base == "ETH":
-        idx = next((i for i, s in enumerate(coins) if s in ("WETH", "ETH")), None)
-    elif base == "WBTC":
-        idx = next((i for i, s in enumerate(coins) if s == "WBTC"), None)
-    else:
-        return None
-
-    if idx is None or idx >= len(usd_prices):
-        return None
-    return float(usd_prices[idx])
+    addr = _CURVE_POOLS.get(pair)
+    return await _fetch_dexscreener(session, addr) if addr else None
 
 
 FETCHERS = {
