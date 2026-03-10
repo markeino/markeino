@@ -63,10 +63,10 @@ DEX_CHAIN = {
 }
 
 # ─── Pool addresses (Ethereum mainnet) ───────────────────────────────────────
-# All prices fetched via DexScreener REST API (no API key required).
-# DexScreener endpoint: GET /latest/dex/pairs/ethereum/{address}
+# All prices fetched via GeckoTerminal REST API (no API key required).
+# GeckoTerminal endpoint: GET /api/v2/networks/eth/pools/{address}
 
-_DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/pairs/ethereum/{}"
+_GECKOTERMINAL_URL = "https://api.geckoterminal.com/api/v2/networks/eth/pools/{}"
 
 _UNISWAP_POOLS = {
     "ETH/USDC":  "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",  # USDC/WETH 0.05%
@@ -139,16 +139,14 @@ last_stale_log: dict[tuple, float] = defaultdict(float)
 
 # ─── Price Fetchers (DexScreener REST API) ────────────────────────────────────
 
-async def _fetch_dexscreener(session: aiohttp.ClientSession,
-                              pool_address: str) -> float | None:
-    url = _DEXSCREENER_URL.format(pool_address)
+async def _fetch_geckoterminal(session: aiohttp.ClientSession,
+                               pool_address: str) -> float | None:
+    url = _GECKOTERMINAL_URL.format(pool_address)
     async with session.get(url, headers=_HEADERS,
                            timeout=aiohttp.ClientTimeout(total=20)) as r:
         data = await r.json(content_type=None)
-    pairs = data.get("pairs") or []
-    if not pairs:
-        return None
-    price_str = pairs[0].get("priceUsd")
+    attrs = data.get("data", {}).get("attributes", {})
+    price_str = attrs.get("base_token_price_usd")
     if price_str is None:
         return None
     return float(price_str)
@@ -156,27 +154,27 @@ async def _fetch_dexscreener(session: aiohttp.ClientSession,
 
 async def fetch_uniswap_v3(session: aiohttp.ClientSession, pair: str) -> float | None:
     addr = _UNISWAP_POOLS.get(pair)
-    return await _fetch_dexscreener(session, addr) if addr else None
+    return await _fetch_geckoterminal(session, addr) if addr else None
 
 
 async def fetch_pancakeswap(session: aiohttp.ClientSession, pair: str) -> float | None:
     addr = _PANCAKE_POOLS.get(pair)
-    return await _fetch_dexscreener(session, addr) if addr else None
+    return await _fetch_geckoterminal(session, addr) if addr else None
 
 
 async def fetch_sushiswap(session: aiohttp.ClientSession, pair: str) -> float | None:
     addr = _SUSHI_PAIRS.get(pair)
-    return await _fetch_dexscreener(session, addr) if addr else None
+    return await _fetch_geckoterminal(session, addr) if addr else None
 
 
 async def fetch_balancer(session: aiohttp.ClientSession, pair: str) -> float | None:
     addr = _BALANCER_POOLS.get(pair)
-    return await _fetch_dexscreener(session, addr) if addr else None
+    return await _fetch_geckoterminal(session, addr) if addr else None
 
 
 async def fetch_curve(session: aiohttp.ClientSession, pair: str) -> float | None:
     addr = _CURVE_POOLS.get(pair)
-    return await _fetch_dexscreener(session, addr) if addr else None
+    return await _fetch_geckoterminal(session, addr) if addr else None
 
 
 FETCHERS = {
