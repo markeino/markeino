@@ -63,42 +63,61 @@ DEX_CHAIN = {
 }
 
 # ─── Pool addresses (Ethereum mainnet) ───────────────────────────────────────
-# All prices fetched via GeckoTerminal REST API (no API key required).
-# GeckoTerminal endpoint: GET /api/v2/networks/eth/pools/{address}
+# Prices read on-chain via public Ethereum JSON-RPC (no API key required).
+# Uniswap v3 / PancakeSwap v3: call slot0() → decode sqrtPriceX96
+# SushiSwap v2: call getReserves() → decode reserve0/reserve1
 
-_GECKOTERMINAL_URL = "https://api.geckoterminal.com/api/v2/networks/eth/pools/{}"
+# Public RPC endpoints tried in order; falls back on timeout/error.
+_RPC_ENDPOINTS = [
+    "https://cloudflare-eth.com",
+    "https://rpc.ankr.com/eth",
+    "https://eth.llamarpc.com",
+    "https://ethereum.publicnode.com",
+]
+_rpc_idx = 0
 
-_UNISWAP_POOLS = {
-    "ETH/USDC":  "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",  # USDC/WETH 0.05%
-    "WBTC/USDC": "0x99ac8ca7087fa4a2a1fb6357269965a2014abc35",  # WBTC/USDC 0.30%
-    "ETH/USDT":  "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36",  # USDT/WETH 0.30%
+# ABI call-data constants
+_SLOT0_DATA    = "0x3850c7bd"   # slot0()        — Uniswap v3 / PancakeSwap v3
+_RESERVES_DATA = "0x0902f1ac"   # getReserves()  — Uniswap v2 / SushiSwap v2
+
+# Per-pool config: (call_data, pool_type, dec0, dec1, base_is_token1)
+#   base_is_token1=True  → volatile asset is token1 (stable = token0, e.g. USDC/WETH)
+#   base_is_token1=False → volatile asset is token0 (stable = token1, e.g. WBTC/USDC)
+# Token ordering follows Ethereum address sort (lower address = token0).
+_POOL_CFG: dict[str, tuple] = {
+    # ── Uniswap v3 ──────────────────────────────────────────────────────────
+    "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640": (_SLOT0_DATA,    "v3", 6,  18, True ),  # USDC/WETH  0.05% → ETH price
+    "0x99ac8ca7087fa4a2a1fb6357269965a2014abc35": (_SLOT0_DATA,    "v3", 8,  6,  False),  # WBTC/USDC  0.30% → WBTC price
+    "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36": (_SLOT0_DATA,    "v3", 18, 6,  False),  # WETH/USDT  0.30% → ETH price
+    # ── PancakeSwap v3 ──────────────────────────────────────────────────────
+    "0x1ac1a8feaaea1900c4166deeed0c11cc10669d36": (_SLOT0_DATA,    "v3", 6,  18, True ),  # USDC/WETH        → ETH price
+    "0xd9e2a1a61b6e61b275cec326465d417e52c1b95c": (_SLOT0_DATA,    "v3", 8,  6,  False),  # WBTC/USDC        → WBTC price
+    "0x6ca298d2983ab03aa1da7679389d955a4efee15c": (_SLOT0_DATA,    "v3", 18, 6,  False),  # WETH/USDT        → ETH price
+    # ── SushiSwap v2 ────────────────────────────────────────────────────────
+    "0x397ff1542f962076d0bfe58ea045ffa2d347aca0": (_RESERVES_DATA, "v2", 6,  18, True ),  # USDC/WETH        → ETH price
+    "0xceff51756c56ceffca006cd410b03ffc46dd3a58": (_RESERVES_DATA, "v2", 8,  6,  False),  # WBTC/USDC        → WBTC price
+    "0x06da0fd433c1a5d7a4faa01111c044910a184553": (_RESERVES_DATA, "v2", 18, 6,  False),  # WETH/USDT        → ETH price
 }
 
+# Logical pool address lookup (unchanged pool addresses, still used by FETCHERS)
+_UNISWAP_POOLS = {
+    "ETH/USDC":  "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+    "WBTC/USDC": "0x99ac8ca7087fa4a2a1fb6357269965a2014abc35",
+    "ETH/USDT":  "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36",
+}
 _PANCAKE_POOLS = {
     "ETH/USDC":  "0x1ac1a8feaaea1900c4166deeed0c11cc10669d36",
     "WBTC/USDC": "0xd9e2a1a61b6e61b275cec326465d417e52c1b95c",
     "ETH/USDT":  "0x6ca298d2983ab03aa1da7679389d955a4efee15c",
 }
-
 _SUSHI_PAIRS = {
     "ETH/USDC":  "0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
     "WBTC/USDC": "0xceff51756c56ceffca006cd410b03ffc46dd3a58",
     "ETH/USDT":  "0x06da0fd433c1a5d7a4faa01111c044910a184553",
 }
-
-# Balancer: use first 20 bytes (contract address) of the 32-byte pool ID
-_BALANCER_POOLS = {
-    "ETH/USDC":  "0x96646936b91d6b9d7d0c47c496afbf3d6ec7b6f",
-    "WBTC/USDC": "0x8a819a4cabd6efcb4e5504fe8679a1abd831dd8f",
-    "ETH/USDT":  "0x3e5fa9518ea95c3e533eb377c001702a9aacaa32",
-}
-
-# Curve tricrypto2 pool address (USDT/WBTC/WETH)
-_CURVE_POOLS = {
-    "ETH/USDC":  "0xd51a44d3fae010294c616388b506acda1bfaae46",
-    "WBTC/USDC": "0xd51a44d3fae010294c616388b506acda1bfaae46",
-    "ETH/USDT":  "0xd51a44d3fae010294c616388b506acda1bfaae46",
-}
+# Balancer and Curve require complex ABI interactions; excluded from on-chain fetching.
+_BALANCER_POOLS: dict[str, str] = {}
+_CURVE_POOLS:    dict[str, str] = {}
 
 # ─── Thresholds ───────────────────────────────────────────────────────────────
 MIN_SPREAD_PCT  = 0.05    # % gross spread to trigger an alert check
@@ -137,44 +156,97 @@ prices: dict[str, dict[str, dict]] = defaultdict(dict)
 last_alert: dict[str, float]       = defaultdict(float)
 last_stale_log: dict[tuple, float] = defaultdict(float)
 
-# ─── Price Fetchers (DexScreener REST API) ────────────────────────────────────
+# ─── On-chain Price Fetchers (public Ethereum JSON-RPC) ──────────────────────
 
-async def _fetch_geckoterminal(session: aiohttp.ClientSession,
-                               pool_address: str) -> float | None:
-    url = _GECKOTERMINAL_URL.format(pool_address)
-    async with session.get(url, headers=_HEADERS,
-                           timeout=aiohttp.ClientTimeout(total=20)) as r:
-        data = await r.json(content_type=None)
-    attrs = data.get("data", {}).get("attributes", {})
-    price_str = attrs.get("base_token_price_usd")
-    if price_str is None:
+def _decode_slot0_price(hex_result: str, dec0: int, dec1: int,
+                        base_is_token1: bool) -> float | None:
+    """Decode sqrtPriceX96 from slot0() and return USD price of the volatile asset."""
+    raw      = bytes.fromhex(hex_result[2:])
+    sqrt_x96 = int.from_bytes(raw[:32], "big")
+    if sqrt_x96 == 0:
         return None
-    return float(price_str)
+    price_raw = (sqrt_x96 / 2**96) ** 2   # token1_raw / token0_raw
+    if base_is_token1:
+        # stable=token0 (e.g. USDC), volatile=token1 (e.g. WETH)
+        # ETH_price = 10^(dec1-dec0) / price_raw
+        return (10 ** (dec1 - dec0)) / price_raw
+    else:
+        # volatile=token0 (e.g. WBTC), stable=token1 (e.g. USDC)
+        # asset_price = price_raw * 10^(dec0-dec1)
+        return price_raw * (10 ** (dec0 - dec1))
+
+
+def _decode_reserves_price(hex_result: str, dec0: int, dec1: int,
+                           base_is_token1: bool) -> float | None:
+    """Decode getReserves() and return USD price of the volatile asset."""
+    raw = bytes.fromhex(hex_result[2:])
+    r0  = int.from_bytes(raw[:32],  "big")
+    r1  = int.from_bytes(raw[32:64], "big")
+    if r0 == 0 or r1 == 0:
+        return None
+    if base_is_token1:
+        return (r0 / r1) * (10 ** (dec1 - dec0))
+    else:
+        return (r1 / r0) * (10 ** (dec0 - dec1))
+
+
+async def _eth_call(session: aiohttp.ClientSession,
+                    to: str, data: str) -> str | None:
+    global _rpc_idx
+    for attempt in range(len(_RPC_ENDPOINTS)):
+        rpc = _RPC_ENDPOINTS[(_rpc_idx + attempt) % len(_RPC_ENDPOINTS)]
+        payload = {
+            "jsonrpc": "2.0", "method": "eth_call",
+            "params": [{"to": to, "data": data}, "latest"],
+            "id": 1,
+        }
+        try:
+            async with session.post(rpc, json=payload, headers=_HEADERS,
+                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                resp = await r.json(content_type=None)
+            result = resp.get("result")
+            if result and result != "0x":
+                return result
+        except Exception:
+            _rpc_idx = (_rpc_idx + 1) % len(_RPC_ENDPOINTS)
+    return None
+
+
+async def _fetch_onchain(session: aiohttp.ClientSession,
+                         pool_address: str) -> float | None:
+    cfg = _POOL_CFG.get(pool_address.lower())
+    if cfg is None:
+        return None
+    call_data, pool_type, dec0, dec1, base_is_token1 = cfg
+    result = await _eth_call(session, pool_address, call_data)
+    if result is None:
+        return None
+    if pool_type == "v3":
+        return _decode_slot0_price(result, dec0, dec1, base_is_token1)
+    return _decode_reserves_price(result, dec0, dec1, base_is_token1)
 
 
 async def fetch_uniswap_v3(session: aiohttp.ClientSession, pair: str) -> float | None:
     addr = _UNISWAP_POOLS.get(pair)
-    return await _fetch_geckoterminal(session, addr) if addr else None
+    return await _fetch_onchain(session, addr) if addr else None
 
 
 async def fetch_pancakeswap(session: aiohttp.ClientSession, pair: str) -> float | None:
     addr = _PANCAKE_POOLS.get(pair)
-    return await _fetch_geckoterminal(session, addr) if addr else None
+    return await _fetch_onchain(session, addr) if addr else None
 
 
 async def fetch_sushiswap(session: aiohttp.ClientSession, pair: str) -> float | None:
     addr = _SUSHI_PAIRS.get(pair)
-    return await _fetch_geckoterminal(session, addr) if addr else None
+    return await _fetch_onchain(session, addr) if addr else None
 
 
 async def fetch_balancer(session: aiohttp.ClientSession, pair: str) -> float | None:
-    addr = _BALANCER_POOLS.get(pair)
-    return await _fetch_geckoterminal(session, addr) if addr else None
+    return None   # Balancer requires vault+pool-id ABI; not yet implemented
 
 
 async def fetch_curve(session: aiohttp.ClientSession, pair: str) -> float | None:
-    addr = _CURVE_POOLS.get(pair)
-    return await _fetch_geckoterminal(session, addr) if addr else None
+    return None   # Curve requires pool-specific ABI; not yet implemented
 
 
 FETCHERS = {
