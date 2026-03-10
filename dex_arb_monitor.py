@@ -10,9 +10,19 @@ import asyncio
 import aiohttp
 import csv
 import os
+import random
 import time
 from collections import defaultdict
 from datetime import datetime
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
 
 # ─── Pairs ────────────────────────────────────────────────────────────────────
 # All routes through USD stablecoins (USDC / USDT / DAI)
@@ -132,8 +142,9 @@ last_stale_log: dict[tuple, float] = defaultdict(float)
 async def _fetch_dexscreener(session: aiohttp.ClientSession,
                               pool_address: str) -> float | None:
     url = _DEXSCREENER_URL.format(pool_address)
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-        data = await r.json()
+    async with session.get(url, headers=_HEADERS,
+                           timeout=aiohttp.ClientTimeout(total=20)) as r:
+        data = await r.json(content_type=None)
     pairs = data.get("pairs") or []
     if not pairs:
         return None
@@ -254,6 +265,9 @@ async def poll_dex(dex_id: str, pair: str) -> None:
     retry_delay = 2
     failures    = 0
     last_err    = ""
+
+    # stagger startup: spread 15 coroutines over 0–5 s to avoid rate-limit burst
+    await asyncio.sleep(random.uniform(0, 5))
 
     print(f"[{dex_id}] Polling {pair}  (chain: {DEX_CHAIN.get(dex_id)})")
 
