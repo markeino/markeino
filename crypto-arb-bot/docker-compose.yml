@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  arb-bot:
+    build: .
+    container_name: crypto-arb-bot
+    restart: unless-stopped
+    environment:
+      # Exchange API credentials (use Docker secrets or .env in production)
+      - BINANCE_API_KEY=${BINANCE_API_KEY:-}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET:-}
+      - OKX_API_KEY=${OKX_API_KEY:-}
+      - OKX_API_SECRET=${OKX_API_SECRET:-}
+      - OKX_PASSPHRASE=${OKX_PASSPHRASE:-}
+      - BYBIT_API_KEY=${BYBIT_API_KEY:-}
+      - BYBIT_API_SECRET=${BYBIT_API_SECRET:-}
+      - KRAKEN_API_KEY=${KRAKEN_API_KEY:-}
+      - KRAKEN_API_SECRET=${KRAKEN_API_SECRET:-}
+      # Config overrides
+      - ARB_TRADING__PAPER_TRADING=${PAPER_TRADING:-true}
+      - ARB_REDIS__URL=redis://redis:6379
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - ./logs:/home/arb/logs
+      - ./config:/home/arb/config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - arb-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: arb-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - arb-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: arb-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - arb-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: arb-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - arb-net
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  arb-net:
+    driver: bridge
