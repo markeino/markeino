@@ -17,14 +17,10 @@ use crate::risk::risk_manager::RiskManager;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use hyper::{
-    service::{make_service_fn, service_fn},
-    Body, Request, Response, Server,
-};
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal;
 use tracing::{error, info, warn};
 
@@ -247,83 +243,69 @@ async fn main() -> Result<()> {
 }
 
 // ─── Metrics HTTP server ──────────────────────────────────────────────────────
+// Pure tokio TCP — no hyper Server, so port conflicts return Err not panic.
 
 async fn start_metrics_server(metrics: Arc<Metrics>, port: u16) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
-    // Use TcpListener so we get a Result instead of a panic on port conflict
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .with_context(|| format!("Cannot bind metrics server to port {}. Is it already in use?", port))?;
+        .with_context(|| format!("Cannot bind metrics server to port {}", port))?;
+    info!("Prometheus metrics available at http://0.0.0.0:{}/metrics", port);
 
-    info!("Prometheus metrics available at http://{}/metrics", addr);
-
-    let make_svc = make_service_fn(move |_conn| {
+    loop {
+        let (mut stream, _) = listener.accept().await?;
         let metrics = Arc::clone(&metrics);
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
-                let metrics = Arc::clone(&metrics);
-                async move {
-                    if req.uri().path() == "/metrics" {
-                        let body = metrics.gather();
-                        Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(200)
-                                .header("Content-Type", "text/plain; version=0.0.4")
-                                .body(Body::from(body))
-                                .unwrap(),
-                        )
-                    } else {
-                        Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(404)
-                                .body(Body::from("Not found"))
-                                .unwrap(),
-                        )
-                    }
-                }
-            }))
-        }
-    });
-
-    Server::from_tcp(listener.into_std()?)?.serve(make_svc).await?;
-    Ok(())
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let (status, content_type, body) = if request.starts_with("GET /metrics") {
+                ("200 OK", "text/plain; version=0.0.4", metrics.gather())
+            } else {
+                ("404 Not Found", "text/plain", "Not found".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status, content_type, body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
 }
 
 // ─── Health check HTTP server ─────────────────────────────────────────────────
 
 async fn start_health_server(port: u16) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .with_context(|| format!("Cannot bind health server to port {}. Is it already in use?", port))?;
+        .with_context(|| format!("Cannot bind health server to port {}", port))?;
+    info!("Health check available at http://0.0.0.0:{}/health", port);
 
-    info!("Health check available at http://{}/health", addr);
-
-    let make_svc = make_service_fn(|_conn| async {
-        Ok::<_, Infallible>(service_fn(|req: Request<Body>| async move {
-            if req.uri().path() == "/health" {
-                Ok::<_, Infallible>(
-                    Response::builder()
-                        .status(200)
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(r#"{"status":"ok"}"#))
-                        .unwrap(),
-                )
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let (status, body) = if request.starts_with("GET /health") {
+                ("200 OK", r#"{"status":"ok"}"#)
             } else {
-                Ok::<_, Infallible>(
-                    Response::builder()
-                        .status(404)
-                        .body(Body::from("Not found"))
-                        .unwrap(),
-                )
-            }
-        }))
-    });
-
-    Server::from_tcp(listener.into_std()?)?.serve(make_svc).await?;
-    Ok(())
+                ("404 Not Found", "Not found")
+            };
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status, body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
 }
 
 // ─── Default config for quick-start without config file ──────────────────────
