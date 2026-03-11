@@ -11,10 +11,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
-use url::Url;
 
 /// Market update broadcast message
 #[derive(Debug, Clone)]
@@ -345,7 +343,7 @@ impl MarketDataCollector {
         config: &AppConfig,
         symbols: &[String],
         price_cache: PriceCache,
-        ob_cache: OrderBookCache,
+        _ob_cache: OrderBookCache,
         tx: broadcast::Sender<MarketUpdate>,
     ) -> Result<()> {
         let url = &config.exchanges.okx.ws_url;
@@ -444,7 +442,7 @@ impl MarketDataCollector {
         config: &AppConfig,
         symbols: &[String],
         price_cache: PriceCache,
-        ob_cache: OrderBookCache,
+        _ob_cache: OrderBookCache,
         tx: broadcast::Sender<MarketUpdate>,
     ) -> Result<()> {
         let url = &config.exchanges.bybit.ws_url;

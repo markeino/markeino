@@ -14,7 +14,6 @@ use crate::execution::order_manager::OrderManager;
 use crate::monitoring::logger::init_logging;
 use crate::monitoring::metrics::{Metrics, Timer};
 use crate::risk::risk_manager::RiskManager;
-use crate::utils::helpers::ExponentialBackoff;
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -100,7 +99,8 @@ async fn main() -> Result<()> {
 
     // ─── Initialize market data collector ────────────────────────────────────
     let market_data = Arc::new(MarketDataCollector::new(Arc::clone(&config))?);
-    let mut market_updates = market_data.subscribe();
+    // Subscribe before starting so we don't miss early updates
+    let _market_updates = market_data.subscribe();
 
     // ─── Initialize order manager ─────────────────────────────────────────────
     let order_manager = Arc::new(OrderManager::new(
@@ -130,19 +130,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ─── Start market data collection (in background) ────────────────────────
-    let market_data_bg = Arc::clone(&market_data);
-    tokio::spawn(async move {
-        let mut backoff = ExponentialBackoff::new(2000, 30000);
-        loop {
-            if let Err(e) = market_data_bg.start().await {
-                error!("Market data collector error: {}. Retrying...", e);
-                backoff.wait().await;
-            } else {
-                backoff.reset();
-            }
-        }
-    });
+    // ─── Start market data collection ────────────────────────────────────────
+    // start() spawns individual per-exchange tasks that each handle their own
+    // reconnection internally — so we only call it once.
+    market_data.start().await?;
 
     info!("All systems initialized. Starting arbitrage scan loop...");
 

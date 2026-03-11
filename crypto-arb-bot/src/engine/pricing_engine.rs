@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::data::types::{ExchangeId, MarketSnapshot, OrderBook, Ticker};
+use crate::data::types::{ExchangeId, MarketSnapshot};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
