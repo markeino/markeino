@@ -92,4 +92,6 @@ mockall = "0.12"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# "unwind" so panics in spawned tasks are caught and logged rather than
+# aborting the whole process (important for background HTTP servers)
+panic = "unwind"

@@ -15,7 +15,7 @@ use crate::monitoring::logger::init_logging;
 use crate::monitoring::metrics::{Metrics, Timer};
 use crate::risk::risk_manager::RiskManager;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use hyper::{
     service::{make_service_fn, service_fn},
@@ -250,6 +250,12 @@ async fn main() -> Result<()> {
 
 async fn start_metrics_server(metrics: Arc<Metrics>, port: u16) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    // Use TcpListener so we get a Result instead of a panic on port conflict
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Cannot bind metrics server to port {}. Is it already in use?", port))?;
+
     info!("Prometheus metrics available at http://{}/metrics", addr);
 
     let make_svc = make_service_fn(move |_conn| {
@@ -280,7 +286,7 @@ async fn start_metrics_server(metrics: Arc<Metrics>, port: u16) -> Result<()> {
         }
     });
 
-    Server::bind(&addr).serve(make_svc).await?;
+    Server::from_tcp(listener.into_std()?)?.serve(make_svc).await?;
     Ok(())
 }
 
@@ -288,6 +294,11 @@ async fn start_metrics_server(metrics: Arc<Metrics>, port: u16) -> Result<()> {
 
 async fn start_health_server(port: u16) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Cannot bind health server to port {}. Is it already in use?", port))?;
+
     info!("Health check available at http://{}/health", addr);
 
     let make_svc = make_service_fn(|_conn| async {
@@ -311,7 +322,7 @@ async fn start_health_server(port: u16) -> Result<()> {
         }))
     });
 
-    Server::bind(&addr).serve(make_svc).await?;
+    Server::from_tcp(listener.into_std()?)?.serve(make_svc).await?;
     Ok(())
 }
 
