@@ -1,0 +1,7 @@
+/target/
+Cargo.lock
+config/local.toml
+logs/
+.env
+*.pem
+*.key

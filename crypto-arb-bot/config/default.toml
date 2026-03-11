@@ -1,0 +1,89 @@
+[server]
+metrics_port = 9090
+health_port = 8080
+
+[redis]
+url = "redis://127.0.0.1:6379"
+cache_ttl_ms = 500
+
+[trading]
+min_profit_threshold = "0.006"    # 0.6% minimum net profit
+max_trade_size_usd = "5000"
+max_daily_loss_usd = "300"
+min_liquidity_usd = "200000"
+max_slippage = "0.003"            # 0.3%
+paper_trading = true              # Set to false for live trading
+base_currency = "USDT"
+
+[exchanges.binance]
+enabled = true
+ws_url = "wss://stream.binance.com:9443/ws"
+rest_url = "https://api.binance.com"
+api_key = ""
+api_secret = ""
+maker_fee = "0.001"
+taker_fee = "0.001"
+withdrawal_fee_eth = "0.005"
+
+[exchanges.okx]
+enabled = true
+ws_url = "wss://ws.okx.com:8443/ws/v5/public"
+rest_url = "https://www.okx.com"
+api_key = ""
+api_secret = ""
+passphrase = ""
+maker_fee = "0.0008"
+taker_fee = "0.001"
+withdrawal_fee_eth = "0.003"
+
+[exchanges.bybit]
+enabled = true
+ws_url = "wss://stream.bybit.com/v5/public/spot"
+rest_url = "https://api.bybit.com"
+api_key = ""
+api_secret = ""
+maker_fee = "0.001"
+taker_fee = "0.001"
+withdrawal_fee_eth = "0.004"
+
+[exchanges.kraken]
+enabled = true
+ws_url = "wss://ws.kraken.com"
+rest_url = "https://api.kraken.com"
+api_key = ""
+api_secret = ""
+maker_fee = "0.0016"
+taker_fee = "0.0026"
+withdrawal_fee_eth = "0.0035"
+
+[dex.uniswap_v3]
+enabled = true
+rpc_url = "https://mainnet.infura.io/v3/YOUR_PROJECT_ID"
+router_address = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+factory_address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+gas_limit = 300000
+
+[dex.sushiswap]
+enabled = true
+rpc_url = "https://mainnet.infura.io/v3/YOUR_PROJECT_ID"
+router_address = "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F"
+
+[dex.pancakeswap]
+enabled = true
+rpc_url = "https://bsc-dataseed.binance.org"
+router_address = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+
+[symbols]
+trading_pairs = ["ETH/USDT", "BTC/USDT", "BNB/USDT", "SOL/USDT", "ARB/USDT"]
+refresh_interval_ms = 200
+
+[risk]
+max_open_positions = 3
+position_timeout_secs = 30
+circuit_breaker_loss_pct = "0.05"  # 5% portfolio loss triggers shutdown
+max_consecutive_losses = 5
+
+[logging]
+level = "info"
+file_path = "logs/arb-bot.log"
+json_format = true
