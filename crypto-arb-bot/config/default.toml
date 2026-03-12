@@ -16,7 +16,7 @@ paper_trading = true              # Set to false for live trading
 base_currency = "USDT"
 
 [exchanges.binance]
-enabled = true
+enabled = false  # geo-blocked in some regions (TLS handshake rejected); re-enable with a VPN
 ws_url = "wss://stream.binance.com:9443/ws"
 rest_url = "https://api.binance.com"
 api_key = ""
