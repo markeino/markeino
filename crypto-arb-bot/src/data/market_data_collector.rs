@@ -5,6 +5,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
+use reqwest::Client as HttpClient;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -79,7 +80,13 @@ impl MarketDataCollector {
     pub fn snapshot(&self, symbol: &str) -> MarketSnapshot {
         let mut tickers = std::collections::HashMap::new();
         let mut order_books = std::collections::HashMap::new();
-        let pool_states = std::collections::HashMap::new();
+        let mut pool_states = std::collections::HashMap::new();
+        for entry in self.pool_cache.iter() {
+            let (exchange, sym) = entry.key();
+            if sym == symbol {
+                pool_states.insert(exchange.clone(), entry.value().clone());
+            }
+        }
 
         for entry in self.price_cache.iter() {
             let (exchange, sym) = entry.key();
@@ -188,13 +195,50 @@ impl MarketDataCollector {
         // Start DEX polling
         if config.dex.uniswap_v3.enabled {
             let p = Arc::clone(&pool_cache);
+            let rpc_url = config.dex.uniswap_v3.rpc_url.clone();
             let interval_ms = config.symbols.refresh_interval_ms;
             let s = symbols.clone();
             tokio::spawn(async move {
                 loop {
                     for symbol in &s {
-                        if let Err(e) = Self::poll_dex_pool(&ExchangeId::UniswapV3, symbol, &p).await {
-                            debug!("DEX poll error: {}", e);
+                        if let Err(e) = Self::poll_dex_pool(&ExchangeId::UniswapV3, symbol, &p, &rpc_url).await {
+                            debug!("UniswapV3 poll error {}: {}", symbol, e);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                }
+            });
+            task_count += 1;
+        }
+
+        if config.dex.sushiswap.enabled {
+            let p = Arc::clone(&pool_cache);
+            let rpc_url = config.dex.sushiswap.rpc_url.clone();
+            let interval_ms = config.symbols.refresh_interval_ms;
+            let s = symbols.clone();
+            tokio::spawn(async move {
+                loop {
+                    for symbol in &s {
+                        if let Err(e) = Self::poll_dex_pool(&ExchangeId::SushiSwap, symbol, &p, &rpc_url).await {
+                            debug!("SushiSwap poll error {}: {}", symbol, e);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                }
+            });
+            task_count += 1;
+        }
+
+        if config.dex.pancakeswap.enabled {
+            let p = Arc::clone(&pool_cache);
+            let rpc_url = config.dex.pancakeswap.rpc_url.clone();
+            let interval_ms = config.symbols.refresh_interval_ms;
+            let s = symbols.clone();
+            tokio::spawn(async move {
+                loop {
+                    for symbol in &s {
+                        if let Err(e) = Self::poll_dex_pool(&ExchangeId::PancakeSwap, symbol, &p, &rpc_url).await {
+                            debug!("PancakeSwap poll error {}: {}", symbol, e);
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(interval_ms)).await;
@@ -653,12 +697,150 @@ impl MarketDataCollector {
     async fn poll_dex_pool(
         exchange: &ExchangeId,
         symbol: &str,
-        _pool_cache: &PoolCache,
+        pool_cache: &PoolCache,
+        rpc_url: &str,
     ) -> Result<()> {
-        // In production this would call The Graph API or direct RPC calls
-        // For now we insert a placeholder that downstream can detect as stale
-        debug!("DEX polling not yet implemented for {}/{}", exchange, symbol);
+        match exchange {
+            ExchangeId::UniswapV3 => {
+                if let Some(info) = get_v3_pool_info(symbol) {
+                    let pool = Self::fetch_uniswap_v3_pool(rpc_url, exchange, symbol, &info).await?;
+                    pool_cache.insert((exchange.clone(), symbol.to_string()), pool);
+                }
+            }
+            ExchangeId::SushiSwap | ExchangeId::PancakeSwap => {
+                if let Some(info) = get_v2_pool_info(exchange, symbol) {
+                    let pool = Self::fetch_v2_pool(rpc_url, exchange, symbol, &info).await?;
+                    pool_cache.insert((exchange.clone(), symbol.to_string()), pool);
+                }
+            }
+            _ => {
+                debug!("DEX polling not implemented for {:?}/{}", exchange, symbol);
+            }
+        }
         Ok(())
+    }
+
+    /// Fetch Uniswap V3 pool state via direct JSON-RPC.
+    /// Calls slot0() for sqrtPriceX96 and liquidity() for the in-range liquidity,
+    /// then derives virtual reserves using the x*y=k approximation.
+    async fn fetch_uniswap_v3_pool(
+        rpc_url: &str,
+        exchange: &ExchangeId,
+        symbol: &str,
+        info: &DexPoolInfo,
+    ) -> Result<PoolState> {
+        // slot0() → (sqrtPriceX96, tick, ...)
+        let slot0_hex = Self::eth_call(rpc_url, info.address, "0x3850c7bd").await?;
+        // liquidity() → uint128
+        let liq_hex = Self::eth_call(rpc_url, info.address, "0x1a686502").await?;
+
+        let sqrt_px96 = abi_word_to_f64(&slot0_hex, 0)?;
+        let liquidity = abi_word_to_u128(&liq_hex, 0)? as f64;
+
+        if sqrt_px96 == 0.0 || liquidity == 0.0 {
+            anyhow::bail!("UniswapV3 {}/{}: zero price or liquidity", exchange, symbol);
+        }
+
+        // Virtual reserves: at price P = (sqrtPriceX96/2^96)^2 (raw token units)
+        //   reserve0_raw = L / sqrt_price_raw = L * 2^96 / sqrtPriceX96
+        //   reserve1_raw = L * sqrt_price_raw = L * sqrtPriceX96 / 2^96
+        let pow96 = 2f64.powi(96);
+        let virtual0_raw = liquidity * pow96 / sqrt_px96;
+        let virtual1_raw = liquidity * sqrt_px96 / pow96;
+
+        // Decimal-adjust
+        let pow_t0 = 10f64.powi(info.token0_decimals as i32);
+        let pow_t1 = 10f64.powi(info.token1_decimals as i32);
+        let (r0, r1) = if info.invert {
+            (virtual1_raw / pow_t1, virtual0_raw / pow_t0)
+        } else {
+            (virtual0_raw / pow_t0, virtual1_raw / pow_t1)
+        };
+
+        let (base, quote) = split_symbol(symbol);
+        Ok(PoolState {
+            exchange: exchange.clone(),
+            pool_address: info.address.to_string(),
+            token0: base.to_string(),
+            token1: quote.to_string(),
+            reserve0: Decimal::from_str(&format!("{:.6}", r0)).unwrap_or(Decimal::ZERO),
+            reserve1: Decimal::from_str(&format!("{:.6}", r1)).unwrap_or(Decimal::ZERO),
+            fee_tier: info.fee_tier,
+            timestamp: Utc::now(),
+        })
+    }
+
+    /// Fetch Uniswap V2-style pool (SushiSwap / PancakeSwap) via getReserves().
+    async fn fetch_v2_pool(
+        rpc_url: &str,
+        exchange: &ExchangeId,
+        symbol: &str,
+        info: &DexPoolInfo,
+    ) -> Result<PoolState> {
+        // getReserves() → (uint112 reserve0, uint112 reserve1, uint32 timestamp)
+        let hex = Self::eth_call(rpc_url, info.address, "0x0902f1ac").await?;
+
+        let r0_raw = abi_word_to_u128(&hex, 0)? as f64;
+        let r1_raw = abi_word_to_u128(&hex, 1)? as f64;
+
+        if r0_raw == 0.0 || r1_raw == 0.0 {
+            anyhow::bail!("V2 {}/{}: zero reserves", exchange, symbol);
+        }
+
+        let pow_t0 = 10f64.powi(info.token0_decimals as i32);
+        let pow_t1 = 10f64.powi(info.token1_decimals as i32);
+        let (r0, r1) = if info.invert {
+            (r1_raw / pow_t1, r0_raw / pow_t0)
+        } else {
+            (r0_raw / pow_t0, r1_raw / pow_t1)
+        };
+
+        let (base, quote) = split_symbol(symbol);
+        Ok(PoolState {
+            exchange: exchange.clone(),
+            pool_address: info.address.to_string(),
+            token0: base.to_string(),
+            token1: quote.to_string(),
+            reserve0: Decimal::from_str(&format!("{:.6}", r0)).unwrap_or(Decimal::ZERO),
+            reserve1: Decimal::from_str(&format!("{:.6}", r1)).unwrap_or(Decimal::ZERO),
+            fee_tier: info.fee_tier,
+            timestamp: Utc::now(),
+        })
+    }
+
+    /// Send an eth_call JSON-RPC request and return the hex result string (without "0x").
+    async fn eth_call(rpc_url: &str, contract: &str, data: &str) -> Result<String> {
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?;
+
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": contract, "data": data}, "latest"],
+            "id": 1
+        });
+
+        let resp: Value = client
+            .post(rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .context("RPC request failed")?
+            .json()
+            .await
+            .context("RPC response parse failed")?;
+
+        if let Some(err) = resp.get("error") {
+            anyhow::bail!("RPC error: {}", err);
+        }
+
+        let result = resp["result"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'result' in RPC response"))?;
+
+        // Strip "0x" prefix
+        Ok(result.trim_start_matches("0x").to_string())
     }
 
     /// Persist a ticker to Redis for cross-process sharing
@@ -676,6 +858,140 @@ impl MarketDataCollector {
         let ttl_secs: u64 = self.config.redis.cache_ttl_ms / 1000 + 1;
         conn.set_ex::<_, _, ()>(&key, value, ttl_secs).await?;
         Ok(())
+    }
+}
+
+// ─── DEX Pool Info ───────────────────────────────────────────────────────────
+
+/// Static pool metadata for a DEX pair.
+struct DexPoolInfo {
+    /// On-chain pool/pair contract address.
+    address: &'static str,
+    /// Pool fee tier as a fraction (e.g. 0.003 = 0.3%).
+    fee_tier: Decimal,
+    /// Decimals of the on-chain token0.
+    token0_decimals: u8,
+    /// Decimals of the on-chain token1.
+    token1_decimals: u8,
+    /// True when the on-chain token ordering is inverted relative to the
+    /// trading pair (token0 is the quote, token1 is the base).
+    /// When true, reserve0/reserve1 are swapped before building PoolState.
+    invert: bool,
+}
+
+fn get_v3_pool_info(symbol: &str) -> Option<DexPoolInfo> {
+    // Uniswap V3 Ethereum mainnet pools.
+    // token0 < token1 by address (lexicographic).
+    match symbol {
+        "ETH/USDT" => Some(DexPoolInfo {
+            // WETH (0xC02…) < USDT (0xdAC…) → token0=WETH, token1=USDT
+            address: "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36",
+            fee_tier: Decimal::from_str("0.003").unwrap(),
+            token0_decimals: 18, // WETH
+            token1_decimals: 6,  // USDT
+            invert: false,
+        }),
+        "BTC/USDT" => Some(DexPoolInfo {
+            // WBTC (0x2260…) < USDT (0xdAC…) → token0=WBTC, token1=USDT
+            address: "0x9Db9e0e53058C89e5B94e29621a205198648425B",
+            fee_tier: Decimal::from_str("0.003").unwrap(),
+            token0_decimals: 8, // WBTC
+            token1_decimals: 6, // USDT
+            invert: false,
+        }),
+        // SOL is not an ERC-20; ARB is on Arbitrum L2 — skip mainnet.
+        _ => None,
+    }
+}
+
+fn get_v2_pool_info(exchange: &ExchangeId, symbol: &str) -> Option<DexPoolInfo> {
+    match (exchange, symbol) {
+        // ── SushiSwap (Ethereum mainnet, Uniswap V2 fork) ──────────────────
+        (ExchangeId::SushiSwap, "ETH/USDT") => Some(DexPoolInfo {
+            // WETH (0xC02…) < USDT (0xdAC…) → token0=WETH, token1=USDT
+            address: "0x06da0fd433C1A5d7a4faa01111c044910A184553",
+            fee_tier: Decimal::from_str("0.003").unwrap(),
+            token0_decimals: 18,
+            token1_decimals: 6,
+            invert: false,
+        }),
+        (ExchangeId::SushiSwap, "BTC/USDT") => Some(DexPoolInfo {
+            // WBTC (0x2260…) < USDT (0xdAC…) → token0=WBTC, token1=USDT
+            address: "0xCEfF51756c56CeFFCA006cD410B03FFC46dd3a58",
+            fee_tier: Decimal::from_str("0.003").unwrap(),
+            token0_decimals: 8,
+            token1_decimals: 6,
+            invert: false,
+        }),
+        // ── PancakeSwap V2 (BSC) ────────────────────────────────────────────
+        (ExchangeId::PancakeSwap, "BNB/USDT") => Some(DexPoolInfo {
+            // On BSC: USDT (0x55d3…) < WBNB (0xbb4C…) → token0=USDT, token1=WBNB
+            // BSC USDT has 18 decimals. Invert so PoolState.price() = USDT/BNB.
+            address: "0x16b9a82891338f9bA80E2D6970fdda79D1eb0daE",
+            fee_tier: Decimal::from_str("0.0025").unwrap(),
+            token0_decimals: 18, // on-chain token0 = BSC USDT
+            token1_decimals: 18, // on-chain token1 = WBNB
+            invert: true,
+        }),
+        (ExchangeId::PancakeSwap, "BTC/USDT") => Some(DexPoolInfo {
+            // BTCB (0x7130…) > USDT (0x55d3…) → token0=USDT, token1=BTCB
+            // Invert so PoolState.price() = USDT/BTC.
+            address: "0x3F803EC2b816Ea7F06EC76aA2B6f2532F9892d62",
+            fee_tier: Decimal::from_str("0.0025").unwrap(),
+            token0_decimals: 18, // on-chain token0 = BSC USDT
+            token1_decimals: 18, // on-chain token1 = BTCB
+            invert: true,
+        }),
+        (ExchangeId::PancakeSwap, "ETH/USDT") => Some(DexPoolInfo {
+            // WETH (0x2170…) > USDT (0x55d3…) → token0=USDT, token1=WETH
+            // Invert so PoolState.price() = USDT/ETH.
+            address: "0x531FEbfeb37a3D0803AB28d26cF7ec7bAC45C8F7",
+            fee_tier: Decimal::from_str("0.0025").unwrap(),
+            token0_decimals: 18, // on-chain token0 = BSC USDT
+            token1_decimals: 18, // on-chain token1 = WETH
+            invert: true,
+        }),
+        _ => None,
+    }
+}
+
+// ─── ABI Decode Helpers ──────────────────────────────────────────────────────
+
+/// Parse a 32-byte ABI word (64 hex chars, no "0x") at `word_idx` as u128.
+/// Works for uint112 and uint128; the value is right-justified in the word.
+fn abi_word_to_u128(hex: &str, word_idx: usize) -> Result<u128> {
+    let start = word_idx * 64;
+    if hex.len() < start + 64 {
+        anyhow::bail!("ABI response too short (have {}, need {})", hex.len(), start + 64);
+    }
+    // Lower 32 hex chars = 16 bytes = 128 bits (value is right-padded to 256 bits)
+    let lower = &hex[start + 32..start + 64];
+    u128::from_str_radix(lower, 16)
+        .map_err(|e| anyhow::anyhow!("abi_word_to_u128 '{}': {}", lower, e))
+}
+
+/// Parse a 32-byte ABI word as f64. Used for uint160 (sqrtPriceX96) where
+/// the value can exceed u128 but f64 precision is sufficient for price math.
+fn abi_word_to_f64(hex: &str, word_idx: usize) -> Result<f64> {
+    let start = word_idx * 64;
+    if hex.len() < start + 64 {
+        anyhow::bail!("ABI response too short");
+    }
+    let word = &hex[start..start + 64];
+    // Split into four 64-bit chunks and accumulate.
+    let a = u64::from_str_radix(&word[0..16], 16).unwrap_or(0) as f64;
+    let b = u64::from_str_radix(&word[16..32], 16).unwrap_or(0) as f64;
+    let c = u64::from_str_radix(&word[32..48], 16).unwrap_or(0) as f64;
+    let d = u64::from_str_radix(&word[48..64], 16).unwrap_or(0) as f64;
+    Ok(a * 2f64.powi(192) + b * 2f64.powi(128) + c * 2f64.powi(64) + d)
+}
+
+/// Split "ETH/USDT" into ("ETH", "USDT").
+fn split_symbol(symbol: &str) -> (&str, &str) {
+    if let Some(idx) = symbol.find('/') {
+        (&symbol[..idx], &symbol[idx + 1..])
+    } else {
+        (symbol, "USDT")
     }
 }
 
