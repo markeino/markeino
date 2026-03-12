@@ -127,7 +127,7 @@ impl MarketDataCollector {
             tokio::spawn(async move {
                 loop {
                     if let Err(e) = Self::connect_binance(&c, &s, Arc::clone(&p), Arc::clone(&o), t.clone()).await {
-                        error!("Binance WS error: {}. Reconnecting in 5s...", e);
+                        error!("Binance WS error: {:#}. Reconnecting in 5s...", e);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -144,7 +144,7 @@ impl MarketDataCollector {
             tokio::spawn(async move {
                 loop {
                     if let Err(e) = Self::connect_okx(&c, &s, Arc::clone(&p), Arc::clone(&o), t.clone()).await {
-                        error!("OKX WS error: {}. Reconnecting in 5s...", e);
+                        error!("OKX WS error: {:#}. Reconnecting in 5s...", e);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -161,7 +161,7 @@ impl MarketDataCollector {
             tokio::spawn(async move {
                 loop {
                     if let Err(e) = Self::connect_bybit(&c, &s, Arc::clone(&p), Arc::clone(&o), t.clone()).await {
-                        error!("Bybit WS error: {}. Reconnecting in 5s...", e);
+                        error!("Bybit WS error: {:#}. Reconnecting in 5s...", e);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -177,7 +177,7 @@ impl MarketDataCollector {
             tokio::spawn(async move {
                 loop {
                     if let Err(e) = Self::connect_kraken(&c, &s, Arc::clone(&p), t.clone()).await {
-                        error!("Kraken WS error: {}. Reconnecting in 5s...", e);
+                        error!("Kraken WS error: {:#}. Reconnecting in 5s...", e);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
