@@ -267,8 +267,21 @@ async def _fetch_price(
 
         if bt == b:
             return raw
-        # Tokens are reversed: raw is the USD price of the quote token
-        # Invert only if safe (guard against near-zero values)
+        # Base token in the pool is NOT ETH (e.g. LINK/WETH, PEPE/WETH, WBTC/WETH).
+        # DexScreener priceUsd = USD price of the non-ETH base (e.g. $9.09 for LINK).
+        # DexScreener priceNative = price of base in ETH (e.g. 0.0044 ETH per LINK).
+        # ETH/USD = priceUsd / priceNative  →  $9.09 / 0.0044 ≈ $2066
+        native_str = entry.get("priceNative")
+        if native_str:
+            try:
+                price_native = float(native_str)
+                if price_native > 1e-18 and raw > 0:
+                    eth_usd = raw / price_native
+                    if eth_usd > 0:
+                        return eth_usd
+            except (ValueError, ZeroDivisionError):
+                pass
+        # Legacy fallback for stablecoin-quoted pools where inversion is safe
         return (1.0 / raw) if raw > 1e-12 else None
 
     # Fallback: first entry with a positive priceUsd
@@ -364,24 +377,34 @@ def check_cross_version_arb(pair: str) -> None:
               gross_pct, fee_buy, fee_sell, net_pct, MIN_TRADE_USDT, profit_usdt)
 
 
+# Triangular arb is only meaningful when all legs are in the same currency.
+# Stablecoin-quoted pairs (USDC/USDT/DAI) give a direct ETH/USD price from
+# DexScreener without relying on priceNative accuracy.  Non-stablecoin pairs
+# (WBTC, LINK, PEPE …) are still monitored for cross-version arb but are
+# deliberately excluded from triangular comparisons to avoid spurious signals.
+_STABLECOIN_QUOTES = {"USDC", "USDT", "DAI"}
+
+def _is_stablecoin_pair(pair: str) -> bool:
+    return pair.split("/")[1].upper() in _STABLECOIN_QUOTES
+
+
 def check_triangular_arb() -> None:
     """
-    Triangular arbitrage across ETH-denominated pairs.
+    Triangular arbitrage across stablecoin-quoted ETH pairs.
 
-    All pairs share ETH as the base; each quote token has an implied USD price
-    via the ETH/quote rate. If ETH appears cheaper in one quote currency vs
-    another, a round-trip trade can be profitable:
+    Restricted to ETH/USDC, ETH/USDT, ETH/DAI so all implied ETH prices are
+    in the same unit (USD) and can be compared directly.  Leg-3 of the trade
+    is always a stablecoin swap (e.g. USDC→DAI) which is cheap and easy to
+    size, making the profit estimate reliable.
 
-        Leg 1: Buy ETH with token A  (ETH/A, cheapest venue)
-        Leg 2: Sell ETH for token B  (ETH/B, most expensive venue)
-        Leg 3: Swap token B → token A on a stablecoin DEX
-
-    Only flags signals where both prices are strictly positive (guards against
-    zero-price data from illiquid or mis-reported pools such as ETH/WBTC when
-    DexScreener returns native-denominated price instead of USD).
+    Non-stablecoin pairs (WBTC, LINK, PEPE …) are excluded because:
+      • Their "ETH price" depends on priceNative accuracy from DexScreener
+      • Leg-3 would be a volatile-asset swap with unpredictable cost/slippage
     """
     eth_price_per_pair: dict[str, float] = {}
     for pair in PAIRS:
+        if not _is_stablecoin_pair(pair):
+            continue
         fresh = _fresh_prices(pair)
         if not fresh:
             continue
@@ -390,9 +413,8 @@ def check_triangular_arb() -> None:
             continue
         mid = len(vals) // 2
         median = vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
-        # Sanity check: reject implausibly low ETH prices (< $100) which
-        # indicate a native-price leak (e.g. ETH denominated in WBTC ≈ 0.05)
-        if median < 100:
+        # Sanity range: plausible ETH/USD price ($10 – $1,000,000)
+        if not (10 < median < 1_000_000):
             continue
         eth_price_per_pair[pair] = median
 
