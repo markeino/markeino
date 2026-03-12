@@ -24,24 +24,35 @@ from datetime import datetime
 from itertools import combinations
 
 # ─── Pairs ────────────────────────────────────────────────────────────────────
+# Replaced OSMO/CRO/WLFI/API3 (no real Ethereum liquidity) with tokens that
+# have deep, active Uniswap V3 pools and high trading volume.
 PAIRS = [
-    "ETH/DAI",
-    "ETH/OSMO",
-    "ETH/CRO",
-    "ETH/WLFI",
-    "ETH/API3",
-    "ETH/USDT",
+    "ETH/USDC",   # most liquid pair in DeFi
+    "ETH/USDT",   # stablecoin — tight spread, high volume
+    "ETH/DAI",    # stablecoin — MakerDAO
+    "ETH/WBTC",   # wrapped Bitcoin — second-deepest pool
+    "ETH/LINK",   # Chainlink — consistently top-10 volume
+    "ETH/UNI",    # Uniswap governance token
+    "ETH/AAVE",   # Aave lending protocol
+    "ETH/LDO",    # Lido staking — surged post-Merge
+    "ETH/PEPE",   # highest-volume memecoin on Uniswap
+    "ETH/MKR",    # MakerDAO — low float, volatile
 ]
 
 # ─── Token addresses (Ethereum mainnet) ───────────────────────────────────────
-# Used for DexScreener search filtering.
+# Used by the token-address discovery endpoint (more reliable than text search).
 TOKEN_ADDRESSES: dict[str, str] = {
     "WETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    "DAI":  "0x6B175474E89094C44Da98b954EedeAC495271d0F",
-    "CRO":  "0xA0b73E1Ff0B80914AB6fe0444E65848C4C34450b",
-    "API3": "0x0b38210ea11411557c13457D4dA7dC6ea731B88a",
+    "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-    # OSMO and WLFI addresses discovered dynamically (bridged/newer tokens)
+    "DAI":  "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+    "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+    "LINK": "0x514910771AF9Ca656af840dff83E8264EcF986CA",
+    "UNI":  "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+    "AAVE": "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
+    "LDO":  "0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32",
+    "PEPE": "0x6982508145454Ce325dDbE47a25d4ec3d2311933",
+    "MKR":  "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2",
 }
 
 # ─── DEX Definitions ──────────────────────────────────────────────────────────
@@ -71,12 +82,28 @@ DEX_FEE_PCT: dict[str, float] = {
 # Per-pair fee overrides (well-known tight-fee pools)
 _DEX_PAIR_FEE: dict[str, dict[str, float]] = {
     "uniswap_v4": {
-        "ETH/DAI":  0.05,
+        "ETH/USDC": 0.05,
         "ETH/USDT": 0.05,
+        "ETH/DAI":  0.05,
+        "ETH/WBTC": 0.30,
+        "ETH/LINK": 0.30,
+        "ETH/UNI":  0.30,
+        "ETH/AAVE": 0.30,
+        "ETH/LDO":  0.30,
+        "ETH/PEPE": 1.00,
+        "ETH/MKR":  0.30,
     },
     "uniswap_v3": {
-        "ETH/DAI":  0.05,
+        "ETH/USDC": 0.05,
         "ETH/USDT": 0.05,
+        "ETH/DAI":  0.05,
+        "ETH/WBTC": 0.30,
+        "ETH/LINK": 0.30,
+        "ETH/UNI":  0.30,
+        "ETH/AAVE": 0.30,
+        "ETH/LDO":  0.30,
+        "ETH/PEPE": 1.00,
+        "ETH/MKR":  0.30,
     },
 }
 
@@ -89,12 +116,14 @@ def get_fee(dex: str, pair: str) -> float:
 # exposes them via an internal pair-address that can be queried normally.
 
 _KNOWN_POOLS: dict[str, dict[str, str]] = {
-    # --- Uniswap V3 (fallback / comparison for pairs not yet on V4) ---
+    # Uniswap V3 — highest-liquidity pool per pair (Ethereum mainnet)
     "uniswap_v3": {
-        "ETH/DAI":  "0x60594a405d53811d3bc4766596efd80fd545a270",  # 0.05%
+        "ETH/USDC": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",  # 0.05%
         "ETH/USDT": "0x11b815efb8f581194ae79006d24e0d814b7697f6",  # 0.05%
+        "ETH/DAI":  "0x60594a405d53811d3bc4766596efd80fd545a270",  # 0.05%
+        "ETH/WBTC": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",  # 0.30%
     },
-    # V4 pools are discovered dynamically (no fixed per-pool contract addresses)
+    # V4 pools — discovered dynamically (liquidity still migrating from V3)
 }
 
 # ─── DexScreener URLs ─────────────────────────────────────────────────────────
