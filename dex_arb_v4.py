@@ -69,8 +69,10 @@ TOKEN_ADDRESSES: dict[str, str] = {
 # DexScreener may use "uniswap_v4", "uniswap-v4", or just "uniswap" with a
 # version field — cast a wide net and include all observed variants.
 _DEXSCREENER_ID_MAP: dict[str, list[str]] = {
-    "uniswap_v4": ["uniswap_v4", "uniswap-v4", "uniswapv4"],
-    "uniswap_v3": ["uniswap_v3", "uniswap-v3", "uniswapv3"],
+    # DexScreener has used several ID variants for V4 — cast a wide net.
+    # "uniswap_v4" is the canonical form but "uniswap" with a v4 label also appears.
+    "uniswap_v4": ["uniswapv4", "uniswap_v4", "uniswap-v4", "uniswap v4"],
+    "uniswap_v3": ["uniswapv3", "uniswap_v3", "uniswap-v3", "uniswap v3"],
 }
 
 # Default LP swap fee (%)
@@ -138,7 +140,7 @@ POLL_INTERVAL        = 12      # seconds (≈ 1 Ethereum block)
 MAX_QUOTE_AGE        = 60.0    # discard quotes older than this
 STALE_LOG_EVERY      = 30.0    # rate-limit stale-quote warnings
 MIN_POOL_LIQUIDITY   = 50_000  # USD — minimum liquidity to flag arb alerts
-DISCOVERY_MIN_LIQ    = 5_000   # USD — lower bar just for pool address discovery
+DISCOVERY_MIN_LIQ    = 1_000   # USD — lower bar just for pool address discovery
 ALERT_LOG_FILE       = "dex_arb_v4_alerts.csv"
 TRI_ARB_THRESHOLD    = 0.10    # min gross spread for triangular arb (%)
 TRI_ARB_COOLDOWN     = 120     # seconds between triangular arb alerts (per pair combo)
@@ -327,11 +329,19 @@ async def _fetch_price(
             price_str = entry.get("priceUsd")
             if price_str:
                 raw = float(price_str)
-                # If tokens are reversed DexScreener still reports the right USD price
-                # for the base token; invert only if needed.
                 bt = _normalize_symbol(entry.get("baseToken", {}).get("symbol", ""))
                 b  = _normalize_symbol(base)
-                return raw if bt == b else (1.0 / raw if raw else None)
+                if bt == b:
+                    return raw  # priceUsd already gives USD price of our base token
+                # Reversed pool: priceUsd is the USD price of the OTHER token (e.g. WBTC
+                # ≈ $84k). Inverting that gives 1/84000 ≈ 0.0000 — meaningless.
+                # Use priceNative instead: that is the exchange rate of base vs quote
+                # (e.g. 40.87 WETH per WBTC), so 1/priceNative = our pair's rate (0.0244).
+                native_str = entry.get("priceNative")
+                if native_str:
+                    native = float(native_str)
+                    return (1.0 / native) if native else None
+                return (1.0 / raw) if raw else None
 
     # Fallback: first entry
     price_str = pairs_data[0].get("priceUsd")
@@ -403,11 +413,13 @@ def check_cross_dex_arb(pair: str) -> None:
     print(f"{'='*64}")
 
     print(f"\n  Price snapshot — {pair}:")
-    print(f"  {'DEX':<16} {'Price (USD)':>14} {'Age(s)':>8}")
+    print(f"  {'DEX':<16} {'Price':>14} {'Age(s)':>8}")
     print(f"  {'-'*42}")
     for dex, v in sorted(prices[pair].items()):
         age = f"{now - v['ts']:.1f}" if v.get("ts") else "—"
-        print(f"  {dex:<16} {v['price']:>14.4f} {age:>8}")
+        p = v['price']
+        fmt = f"{p:.6f}" if p < 1.0 else f"{p:.4f}"
+        print(f"  {dex:<16} {fmt:>14} {age:>8}")
     print()
 
     log_alert(ts, "cross_dex", pair,
@@ -540,11 +552,13 @@ async def status_printer() -> None:
             if not data:
                 continue
             print(f"\n  {pair}")
-            print(f"  {'DEX':<16} {'Price (USD)':>14} {'Age(s)':>8}")
+            print(f"  {'DEX':<16} {'Price':>14} {'Age(s)':>8}")
             print(f"  {'-'*42}")
             for dex, v in sorted(data.items()):
                 age = f"{now - v['ts']:.1f}" if v.get("ts") else "—"
-                print(f"  {dex:<16} {v['price']:>14.4f} {age:>8}")
+                p = v['price']
+                fmt = f"{p:.6f}" if p < 1.0 else f"{p:.4f}"
+                print(f"  {dex:<16} {fmt:>14} {age:>8}")
         print(f"\n{'─'*64}\n")
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
