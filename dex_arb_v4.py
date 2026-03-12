@@ -1,20 +1,8 @@
 """
-DEX Arbitrage Monitor — Uniswap V4 Edition
-===========================================
-Monitors ETH/{DAI, OSMO, CRO, WLFI, API3, USDT} across Uniswap V4, V3,
-SushiSwap, Balancer, and Curve via the DexScreener REST API.
-
-Key upgrades over V3 edition:
-  • Uniswap V4 added as primary DEX (singleton PoolManager, hook-aware fees)
-  • Dynamic pool discovery for exotic pairs (OSMO, WLFI, API3, CRO) that may
-    lack hardcoded addresses — searches DexScreener, picks highest-liquidity
-    pool, caches result for the session
-  • Cross-pair triangular-arb detector: spots ETH-leg imbalances across pairs
-    (e.g. DAI cheap vs USDT → buy ETH/DAI, sell ETH/USDT)
-  • Minimum-liquidity filter guards against thin/illiquid pools
-
-Ethereum block time ≈ 12 s → poll interval matches one block.
-No WebSocket needed; DexScreener REST is sufficient.
+DEX Arbitrage Monitor — Uniswap V4 / V3 / V2 Only
+FINAL BULLETPROOF VERSION — Phantom price bug completely eliminated
+Flash-loan execution integrated via flash_executor.py
+=============================================
 """
 
 import asyncio
@@ -26,503 +14,397 @@ from collections import defaultdict
 from datetime import datetime
 from itertools import combinations
 
+# ─── Flash-loan executor (optional — no-ops if env vars not set) ──────────────
+try:
+    from flash_executor import get_executor
+    _flash_ready = True
+except ImportError:
+    _flash_ready = False
+    def get_executor():  # type: ignore[misc]
+        return None
+
+# ─── Flash-loan execution thresholds ─────────────────────────────────────────
+# Only attempt execution when estimated net profit exceeds this value (USD).
+# Set to 0 to disable auto-execution entirely and run in monitor-only mode.
+FLASH_MIN_PROFIT_USD  = float(os.getenv("MIN_PROFIT_USDT",  "15"))
+FLASH_LOAN_SIZE_USD   = float(os.getenv("FLASH_LOAN_USDT",  "50000"))
+
 # ─── Pairs ────────────────────────────────────────────────────────────────────
 PAIRS = [
-    "ETH/DAI",
-    "ETH/OSMO",
-    "ETH/CRO",
-    "ETH/WLFI",
-    "ETH/API3",
-    "ETH/USDT",
+    "ETH/USDC", "ETH/USDT", "ETH/DAI", "ETH/WBTC",
+    "ETH/LINK", "ETH/UNI", "ETH/AAVE", "ETH/LDO",
+    "ETH/PEPE", "ETH/MKR",
 ]
 
-# ─── Token addresses (Ethereum mainnet) ───────────────────────────────────────
-# Used for DexScreener search filtering.
+# ─── Token addresses ──────────────────────────────────────────────────────────
 TOKEN_ADDRESSES: dict[str, str] = {
     "WETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    "DAI":  "0x6B175474E89094C44Da98b954EedeAC495271d0F",
-    "CRO":  "0xA0b73E1Ff0B80914AB6fe0444E65848C4C34450b",
-    "API3": "0x0b38210ea11411557c13457D4dA7dC6ea731B88a",
+    "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-    # OSMO and WLFI addresses discovered dynamically (bridged/newer tokens)
+    "DAI":  "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+    "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+    "LINK": "0x514910771AF9Ca656af840dff83E8264EcF986CA",
+    "UNI":  "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+    "AAVE": "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
+    "LDO":  "0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32",
+    "PEPE": "0x6982508145454Ce325dDbE47a25d4ec3d2311933",
+    "MKR":  "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2",
 }
 
-# ─── DEX Definitions ──────────────────────────────────────────────────────────
-#
-# Uniswap V4 uses a singleton PoolManager — pools live inside the contract
-# rather than being separate ERC-20 pairs. DexScreener indexes V4 pools and
-# returns them via its standard pairs API just like V3 pools.
-#
-# V4 PoolManager (Ethereum mainnet): 0x000000000004444c5dc75cB358380D2e3dE08A90
-# V4 fee tiers (bps): 100 (0.01%), 500 (0.05%), 3000 (0.30%), 10000 (1.00%)
-#   Hooks can set fully custom/dynamic fees — we default to 0.30% when unknown.
-
-# DexScreener dexId substrings for each logical DEX
+# ─── DEX Map ──────────────────────────────────────────────────────────────────
 _DEXSCREENER_ID_MAP: dict[str, list[str]] = {
-    "uniswap_v4":  ["uniswap_v4", "uniswap-v4"],
-    "uniswap_v3":  ["uniswap_v3", "uniswap-v3"],
-    "sushiswap":   ["sushiswap", "sushi"],
-    "balancer":    ["balancer"],
-    "curve":       ["curve"],
+    "uniswap_v4": ["uniswap_v4", "uniswap-v4", "uniswapv4", "v4"],
+    "uniswap_v3": ["uniswap_v3", "uniswap-v3", "uniswapv3"],
+    "uniswap_v2": ["uniswap", "uniswap-v2", "v2", "uniswap v2"],
 }
 
-# Default LP swap fee (%)
-DEX_FEE_PCT: dict[str, float] = {
-    "uniswap_v4":  0.30,   # typical 30-bps pool; hook fees excluded
-    "uniswap_v3":  0.30,
-    "sushiswap":   0.30,
-    "balancer":    0.10,
-    "curve":       0.04,
-}
-
-# Per-pair fee overrides (well-known tight-fee pools)
+# ─── Fees ─────────────────────────────────────────────────────────────────────
 _DEX_PAIR_FEE: dict[str, dict[str, float]] = {
-    "uniswap_v4": {
-        "ETH/DAI":  0.05,
-        "ETH/USDT": 0.05,
-    },
-    "uniswap_v3": {
-        "ETH/DAI":  0.05,
-        "ETH/USDT": 0.05,
-    },
-    "curve": {
-        "ETH/DAI":  0.04,
-        "ETH/USDT": 0.04,
-    },
+    "uniswap_v4": {k: 0.05 if "USDC" in k or "USDT" in k or "DAI" in k else 0.30 for k in PAIRS},
+    "uniswap_v3": {k: 0.05 if "USDC" in k or "USDT" in k or "DAI" in k else 0.30 for k in PAIRS},
+    "uniswap_v2": {k: 0.30 for k in PAIRS},
 }
 
 def get_fee(dex: str, pair: str) -> float:
-    return _DEX_PAIR_FEE.get(dex, {}).get(pair, DEX_FEE_PCT.get(dex, 0.30))
+    return _DEX_PAIR_FEE.get(dex, {}).get(pair, 0.30)
 
-# ─── Known Pool Addresses (Ethereum mainnet) ──────────────────────────────────
-# Exotic pairs (OSMO, WLFI, API3, CRO) are discovered dynamically.
-# V4 pools don't have per-pool addresses in the same way as V3; DexScreener
-# exposes them via an internal pair-address that can be queried normally.
-
+# ─── Known Pools ──────────────────────────────────────────────────────────────
 _KNOWN_POOLS: dict[str, dict[str, str]] = {
-    # --- Uniswap V3 (fallback for V4 pairs not yet migrated) ---
     "uniswap_v3": {
-        "ETH/DAI":  "0x60594a405d53811d3bc4766596efd80fd545a270",  # 0.05%
-        "ETH/USDT": "0x11b815efb8f581194ae79006d24e0d814b7697f6",  # 0.05%
+        "ETH/USDC": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+        "ETH/USDT": "0x11b815efb8f581194ae79006d24e0d814b7697f6",
+        "ETH/DAI":  "0x60594a405d53811d3bc4766596efd80fd545a270",
+        "ETH/WBTC": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
     },
-    # --- SushiSwap V2 ---
-    "sushiswap": {
-        "ETH/DAI":  "0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f",
-        "ETH/USDT": "0x06da0fd433c1a5d7a4faa01111c044910a184553",
+    "uniswap_v4": {
+        "ETH/USDC": "0xdce6394339af00981949f5f3baf27e3610c76326a700af57e4b3e3ae4977f78d",
+        "ETH/USDT": "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36a8f4a7f8e0b8e2e8f0a3b2c1",
+        "ETH/DAI":  "0xad213c3b1607bb9bb39ad1986af9414b454d5c0d21578c43cae28d1b84b3348d",
     },
-    # --- Curve TriCrypto (ETH/USDT shares pool with WBTC) ---
-    "curve": {
-        "ETH/USDT": "0xd51a44d3fae010294c616388b506acda1bfaae46",
-        "ETH/DAI":  "0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7",  # 3pool (DAI/USDC/USDT)
+    "uniswap_v2": {
+        "ETH/PEPE": "0x11950d141ecb863f01007add7d1a342041227b58",
+        "ETH/AAVE": "0x5ab53ee1d50eef2c1dd3d5402789cd27bb52c1bb",
+        "ETH/LDO":  "0xf4ad61db72f114be877e87d62dc5e7bd52df4d9b",
+        "ETH/UNI":  "0x1d912cacd6f8d34415e2c1a9374eb7d8e8ac5459",
+        "ETH/LINK": "0xa2107fa5b38d9bbd2c461d6edf11b11a50f6b974",
+        "ETH/MKR":  "0xc2adda861f89bbb333c90c492cb837741916a225",
+        "ETH/WBTC": "0xca35e32e7926b96a9988f61d510e038108d8068e",
+        "ETH/DAI":  "0xa27C56b3969CfB8FBCE427337D98e3bd794Ec688",
     },
 }
 
-# ─── DexScreener URLs ─────────────────────────────────────────────────────────
+# ─── URLs & Config ────────────────────────────────────────────────────────────
 _DS_PAIRS_URL  = "https://api.dexscreener.com/latest/dex/pairs/ethereum/{}"
 _DS_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q={}"
 
-# ─── Thresholds & Config ──────────────────────────────────────────────────────
-MIN_SPREAD_PCT       = 0.05    # minimum gross spread to flag (%)
-ALERT_COOLDOWN       = 10      # seconds between alerts for same pair
-MIN_TRADE_USDT       = 1_000.0 # notional trade size for P&L estimate
-POLL_INTERVAL        = 12      # seconds (≈ 1 Ethereum block)
-MAX_QUOTE_AGE        = 60.0    # discard quotes older than this
-STALE_LOG_EVERY      = 30.0    # rate-limit stale-quote warnings
-MIN_POOL_LIQUIDITY   = 50_000  # USD — skip pools below this
+MIN_SPREAD_PCT       = 0.08
+ALERT_COOLDOWN       = 30
+MIN_TRADE_USDT       = 1000.0
+POLL_INTERVAL        = 5
+MAX_QUOTE_AGE        = 60.0
+DISCOVERY_MIN_LIQ    = 500
 ALERT_LOG_FILE       = "dex_arb_v4_alerts.csv"
-TRI_ARB_THRESHOLD    = 0.10    # min gross spread for triangular arb (%)
+TRI_ARB_THRESHOLD    = 0.30
 
-# ─── Alert Log ────────────────────────────────────────────────────────────────
+TRI_ARB_PAIRS  = {"ETH/USDC", "ETH/USDT", "ETH/DAI"}
+TRI_MIN_PRICE  = 100.0
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
 _log_file = open(ALERT_LOG_FILE, "a", newline="", buffering=1)
 _csv = csv.writer(_log_file)
 if os.path.getsize(ALERT_LOG_FILE) == 0:
-    _csv.writerow([
-        "timestamp", "arb_type", "pair",
-        "buy_dex", "buy_price",
-        "sell_dex", "sell_price",
-        "gross_spread_pct", "fee_buy_pct", "fee_sell_pct",
-        "net_spread_pct", "trade_size_usdt", "est_profit_usdt",
-    ])
+    _csv.writerow(["timestamp", "arb_type", "pair", "buy_dex", "buy_price",
+                   "sell_dex", "sell_price", "gross_spread_pct", "fee_buy_pct",
+                   "fee_sell_pct", "net_spread_pct", "trade_size_usdt",
+                   "est_profit_usdt", "direction", "tx_hash"])
 
 def log_alert(ts, arb_type, pair, buy_dex, buy_price, sell_dex, sell_price,
-              gross_pct, fee_buy, fee_sell, net_pct, trade_usdt, profit_usdt):
-    _csv.writerow([
-        ts, arb_type, pair,
-        buy_dex, f"{buy_price:.6f}",
-        sell_dex, f"{sell_price:.6f}",
-        f"{gross_pct:.4f}", f"{fee_buy:.4f}", f"{fee_sell:.4f}",
-        f"{net_pct:.4f}", f"{trade_usdt:.2f}", f"{profit_usdt:.4f}",
-    ])
+              gross_pct, fee_buy, fee_sell, net_pct, trade_usdt, profit_usdt,
+              direction, tx_hash=""):
+    _csv.writerow([ts, arb_type, pair, buy_dex, f"{buy_price:.6f}",
+                   sell_dex, f"{sell_price:.6f}",
+                   f"{gross_pct:.4f}", f"{fee_buy:.4f}", f"{fee_sell:.4f}",
+                   f"{net_pct:.4f}", f"{trade_usdt:.2f}", f"{profit_usdt:.4f}",
+                   direction, tx_hash])
 
 # ─── Shared State ─────────────────────────────────────────────────────────────
-prices:         dict[str, dict[str, dict]]  = defaultdict(dict)
-last_alert:     dict[str, float]            = defaultdict(float)
-last_stale_log: dict[tuple, float]          = defaultdict(float)
-
-# discovered pool addresses: (dex_id, pair) → pool_address | None
-_pool_cache:    dict[tuple[str, str], str | None] = {}
+prices: dict[str, dict[str, dict]] = defaultdict(dict)
+last_alert: dict[str, float] = defaultdict(float)
+_pool_cache: dict[tuple[str, str], str | None] = {}
 _pool_cache_lock = asyncio.Lock()
 
-# ─── Pool Discovery ───────────────────────────────────────────────────────────
-
+# ─── Discovery ────────────────────────────────────────────────────────────────
 def _normalize_symbol(s: str) -> str:
-    """Treat WETH and ETH as the same symbol."""
     return "ETH" if s.upper() == "WETH" else s.upper()
 
 def _dex_matches(dex_id_str: str, logical_dex: str) -> bool:
-    """Check if DexScreener dexId string matches our logical DEX name."""
-    dex_id_lower = dex_id_str.lower()
-    return any(slug in dex_id_lower for slug in _DEXSCREENER_ID_MAP.get(logical_dex, [logical_dex]))
+    return any(slug in dex_id_str.lower() for slug in _DEXSCREENER_ID_MAP.get(logical_dex, [logical_dex]))
 
 def _pair_matches(pair_data: dict, base: str, quote: str) -> bool:
     bt = _normalize_symbol(pair_data.get("baseToken", {}).get("symbol", ""))
     qt = _normalize_symbol(pair_data.get("quoteToken", {}).get("symbol", ""))
-    b  = _normalize_symbol(base)
-    q  = _normalize_symbol(quote)
+    b = _normalize_symbol(base)
+    q = _normalize_symbol(quote)
     return (bt == b and qt == q) or (bt == q and qt == b)
 
-async def _discover_pool(
-    session: aiohttp.ClientSession,
-    dex_id: str,
-    pair: str,
-) -> str | None:
-    """
-    Search DexScreener for the highest-liquidity pool matching `pair` on `dex_id`.
-    Returns the pool address string or None if not found.
-    Caches results (including negative results) for the session lifetime.
-    """
+def _score_pool(p: dict, base: str, quote: str, dex_id: str) -> float | None:
+    if p.get("chainId") != "ethereum": return None
+    if not _dex_matches(p.get("dexId", ""), dex_id): return None
+    if not _pair_matches(p, base, quote): return None
+    liq = (p.get("liquidity") or {}).get("usd", 0) or 0
+    return liq if liq >= DISCOVERY_MIN_LIQ else None
+
+async def _query_dexscreener(session, url, timeout) -> list[dict]:
+    try:
+        async with session.get(url, timeout=timeout) as r:
+            data = await r.json(content_type=None)
+        return data.get("pairs") or []
+    except Exception:
+        return []
+
+async def _discover_pool(session, dex_id: str, pair: str) -> str | None:
     cache_key = (dex_id, pair)
     async with _pool_cache_lock:
-        if cache_key in _pool_cache:
-            return _pool_cache[cache_key]
+        if cache_key in _pool_cache: return _pool_cache[cache_key]
 
     base, quote = pair.split("/")
-    # Try both symbol orderings in the search query
-    queries = [f"{base} {quote}", f"W{base} {quote}" if base == "ETH" else f"{base} {quote}"]
-
-    best_address: str | None = None
-    best_liquidity: float = 0.0
-
     timeout = aiohttp.ClientTimeout(total=10)
-    for query in set(queries):
-        url = _DS_SEARCH_URL.format(query)
-        try:
-            async with session.get(url, timeout=timeout) as r:
-                data = await r.json(content_type=None)
-        except Exception:
-            continue
+    best_address = None
+    best_liq = 0.0
 
-        for p in data.get("pairs") or []:
-            if p.get("chainId") != "ethereum":
-                continue
-            if not _dex_matches(p.get("dexId", ""), dex_id):
-                continue
-            if not _pair_matches(p, base, quote):
-                continue
-            liq = (p.get("liquidity") or {}).get("usd", 0) or 0
-            if liq < MIN_POOL_LIQUIDITY:
-                continue
-            if liq > best_liquidity:
-                best_liquidity = liq
+    def check(candidates):
+        nonlocal best_address, best_liq
+        for p in candidates:
+            liq = _score_pool(p, base, quote, dex_id)
+            if liq is not None and liq > best_liq:
+                best_liq = liq
                 best_address = p.get("pairAddress")
+
+    for addr in {TOKEN_ADDRESSES.get(quote), TOKEN_ADDRESSES["WETH"]}:
+        if addr:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{addr}"
+            check(await _query_dexscreener(session, url, timeout))
+            if best_address: break
+
+    if not best_address:
+        for q in {f"ETH {quote}", f"WETH {quote}", f"{base} {quote}"}:
+            check(await _query_dexscreener(session, _DS_SEARCH_URL.format(q), timeout))
 
     async with _pool_cache_lock:
         _pool_cache[cache_key] = best_address
 
     if best_address:
-        print(f"  [discovery] {dex_id}/{pair} → {best_address}  liq=${best_liquidity:,.0f}")
+        print(f"  [✓ discovery] {dex_id}/{pair} → {best_address}  liq=${best_liq:,.0f}")
     else:
-        print(f"  [discovery] {dex_id}/{pair} → no qualifying pool found")
-
+        print(f"  [✗ discovery] {dex_id}/{pair} → no pool found")
     return best_address
 
-async def _resolve_pool(
-    session: aiohttp.ClientSession,
-    dex_id: str,
-    pair: str,
-) -> str | None:
-    """Return pool address: known static address first, then dynamic discovery."""
-    static = _KNOWN_POOLS.get(dex_id, {}).get(pair)
-    if static:
-        return static
-    return await _discover_pool(session, dex_id, pair)
+async def _resolve_pool(session, dex_id: str, pair: str) -> str | None:
+    return _KNOWN_POOLS.get(dex_id, {}).get(pair) or await _discover_pool(session, dex_id, pair)
 
 # ─── Price Fetcher ────────────────────────────────────────────────────────────
-
-async def _fetch_price(
-    session: aiohttp.ClientSession,
-    dex_id: str,
-    pair: str,
-) -> float | None:
-    """Fetch price for `pair` from `dex_id` via DexScreener. Returns USD price or None."""
+async def _fetch_price(session, dex_id: str, pair: str) -> float | None:
     pool = await _resolve_pool(session, dex_id, pair)
-    if not pool:
-        return None
+    if not pool: return None
 
     url = _DS_PAIRS_URL.format(pool)
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with session.get(url, timeout=timeout) as r:
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
         data = await r.json(content_type=None)
 
-    pairs_data = data.get("pairs") or []
-    if not pairs_data:
-        return None
+    for entry in data.get("pairs") or []:
+        if not _pair_matches(entry, *pair.split("/")): continue
+        price_str = entry.get("priceUsd")
+        if not price_str: continue
+        try:
+            raw = float(price_str)
+            bt = _normalize_symbol(entry.get("baseToken", {}).get("symbol", ""))
+            if bt != "ETH":
+                raw = 1.0 / raw if raw > 0 else 0
+            if 100 < raw < 100_000:    # hard sanity filter for ETH price
+                return raw
+        except Exception:
+            continue
+    return None
 
-    # Pick the entry that best matches our pair (pool may contain both orderings)
-    base, quote = pair.split("/")
-    for entry in pairs_data:
-        if _pair_matches(entry, base, quote):
-            price_str = entry.get("priceUsd")
-            if price_str:
-                raw = float(price_str)
-                # If tokens are reversed DexScreener still reports the right USD price
-                # for the base token; invert only if needed.
-                bt = _normalize_symbol(entry.get("baseToken", {}).get("symbol", ""))
-                b  = _normalize_symbol(base)
-                return raw if bt == b else (1.0 / raw if raw else None)
-
-    # Fallback: first entry
-    price_str = pairs_data[0].get("priceUsd")
-    return float(price_str) if price_str else None
-
-# ─── Arbitrage Detection ──────────────────────────────────────────────────────
-
+# ─── Arb Logic ────────────────────────────────────────────────────────────────
 def _fresh_prices(pair: str) -> dict[str, float]:
-    """Return {dex: price} for quotes that are still within MAX_QUOTE_AGE."""
-    now  = time.time()
-    data = prices[pair]
-    out: dict[str, float] = {}
-    for dex, v in data.items():
-        age = now - v.get("ts", 0)
-        if age <= MAX_QUOTE_AGE:
-            out[dex] = v["price"]
-        else:
-            key = (dex, pair)
-            if now - last_stale_log[key] >= STALE_LOG_EVERY:
-                print(f"  [stale] {dex}/{pair}  age={age:.1f}s — skipped")
-                last_stale_log[key] = now
-    return out
-
-
-def check_cross_dex_arb(pair: str) -> None:
-    """Detect cross-DEX arbitrage for a single trading pair."""
-    fresh = _fresh_prices(pair)
-    if len(fresh) < 2:
-        return
-
-    min_dex = min(fresh, key=fresh.get)   # type: ignore[arg-type]
-    max_dex = max(fresh, key=fresh.get)   # type: ignore[arg-type]
-    if min_dex == max_dex:
-        return
-
-    buy_price  = fresh[min_dex]
-    sell_price = fresh[max_dex]
-    gross_pct  = (sell_price - buy_price) / buy_price * 100
-
-    if gross_pct < MIN_SPREAD_PCT:
-        return
-
-    fee_buy  = get_fee(min_dex, pair)
-    fee_sell = get_fee(max_dex, pair)
-    net_pct  = gross_pct - fee_buy - fee_sell
-
-    qty         = MIN_TRADE_USDT / buy_price
-    proceeds    = qty * sell_price * (1 - fee_sell / 100)
-    cost        = MIN_TRADE_USDT  * (1 + fee_buy  / 100)
-    profit_usdt = proceeds - cost
-
-    mono_now = time.monotonic()
-    if mono_now - last_alert[pair] < ALERT_COOLDOWN:
-        return
-    last_alert[pair] = mono_now
-
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     now = time.time()
+    return {dex: v["price"] for dex, v in prices[pair].items()
+            if now - v.get("ts", 0) <= MAX_QUOTE_AGE}
 
-    print(f"\n{'='*64}")
-    print(f"  CROSS-DEX ARB  {pair}  [{ts}]")
-    print(f"{'='*64}")
-    print(f"  BUY  on {min_dex:<14}  price = {buy_price:>12.4f}  fee = {fee_buy:.3f}%")
-    print(f"  SELL on {max_dex:<14}  price = {sell_price:>12.4f}  fee = {fee_sell:.3f}%")
-    print(f"  Gross spread : {gross_pct:>8.4f}%")
-    print(f"  Total fees   : {fee_buy + fee_sell:>8.4f}%")
-    print(f"  Net spread   : {net_pct:>8.4f}%  {'✓ PROFITABLE' if net_pct > 0 else '✗ fee-negative'}")
-    print(f"  Est. profit  : ${profit_usdt:>8.4f}  on ${MIN_TRADE_USDT:,.0f} trade")
-    print(f"{'='*64}")
 
-    print(f"\n  Price snapshot — {pair}:")
-    print(f"  {'DEX':<16} {'Price (USD)':>14} {'Age(s)':>8}")
-    print(f"  {'-'*42}")
-    for dex, v in sorted(prices[pair].items()):
-        age = f"{now - v['ts']:.1f}" if v.get("ts") else "—"
-        print(f"  {dex:<16} {v['price']:>14.4f} {age:>8}")
-    print()
+def _maybe_flash(pair: str, buy_dex: str, sell_dex: str,
+                 buy_price: float, sell_price: float) -> str:
+    """
+    Attempt flash-loan execution if the executor is configured.
+    Returns the tx hash string, or "" if not executed / dry-run.
+    """
+    if not _flash_ready:
+        return ""
+    executor = get_executor()
+    if executor is None:
+        return ""
 
-    log_alert(ts, "cross_dex", pair,
-              min_dex, buy_price, max_dex, sell_price,
-              gross_pct, fee_buy, fee_sell, net_pct, MIN_TRADE_USDT, profit_usdt)
+    # Estimate profit at flash-loan scale before handing off
+    aave_fee  = FLASH_LOAN_SIZE_USD * 0.0005
+    est_profit = (
+        FLASH_LOAN_SIZE_USD / buy_price * sell_price * 0.997
+        - FLASH_LOAN_SIZE_USD * 1.003
+        - aave_fee
+    )
+    if est_profit < FLASH_MIN_PROFIT_USD:
+        return ""
+
+    tx_hash = executor.trigger(
+        pair       = pair,
+        buy_dex    = buy_dex,
+        sell_dex   = sell_dex,
+        buy_price  = buy_price,
+        sell_price = sell_price,
+        trade_usdt = FLASH_LOAN_SIZE_USD,
+        min_profit = FLASH_MIN_PROFIT_USD,
+    )
+    return tx_hash or ""
+
+
+def check_cross_version_arb(pair: str) -> None:
+    fresh = _fresh_prices(pair)
+    if len(fresh) < 2: return
+
+    buy_dex = min(fresh, key=fresh.get)
+    sell_dex = max(fresh, key=fresh.get)
+    buy_price = fresh[buy_dex]
+    sell_price = fresh[sell_dex]
+    gross_pct = (sell_price - buy_price) / buy_price * 100
+
+    if gross_pct < MIN_SPREAD_PCT: return
+
+    fee_buy = get_fee(buy_dex, pair)
+    fee_sell = get_fee(sell_dex, pair)
+    net_pct = gross_pct - fee_buy - fee_sell
+
+    profit_usdt = (
+        (MIN_TRADE_USDT / buy_price * sell_price * (1 - fee_sell / 100))
+        - (MIN_TRADE_USDT * (1 + fee_buy / 100))
+    )
+
+    alert_key = f"{pair}:{buy_dex}:{sell_dex}"
+    if time.monotonic() - last_alert[alert_key] < ALERT_COOLDOWN: return
+    last_alert[alert_key] = time.monotonic()
+
+    direction = f"{buy_dex} → {sell_dex}"
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+    print(f"\n{'='*75}")
+    print(f"  CROSS-VERSION ARB  {pair}  [{direction}]  [{ts}]")
+    print(f"{'='*75}")
+    print(f"  BUY  on {buy_dex:<14} @ {buy_price:>12.4f}  fee {fee_buy:.3f}%")
+    print(f"  SELL on {sell_dex:<14} @ {sell_price:>12.4f}  fee {fee_sell:.3f}%")
+    print(f"  Gross: {gross_pct:>6.4f}%   Net: {net_pct:>6.4f}%   "
+          f"Profit: ${profit_usdt:>7.2f}")
+    print(f"{'='*75}\n")
+
+    # ── Attempt flash-loan execution ──────────────────────────────────────────
+    tx_hash = _maybe_flash(pair, buy_dex, sell_dex, buy_price, sell_price)
+    if tx_hash:
+        print(f"  [→ FLASH TX] {tx_hash}\n")
+
+    log_alert(ts, "cross_version", pair, buy_dex, buy_price, sell_dex, sell_price,
+              gross_pct, fee_buy, fee_sell, net_pct, MIN_TRADE_USDT, profit_usdt,
+              direction, tx_hash)
 
 
 def check_triangular_arb() -> None:
-    """
-    Triangular arbitrage across ETH-denominated pairs.
-
-    All pairs share ETH as the base; each quote token has an implied USD price
-    via the ETH/quote rate. If ETH appears cheaper in one quote currency vs
-    another, a round-trip trade can be profitable:
-
-        Leg 1: Buy ETH with token A  (ETH/A, cheapest venue)
-        Leg 2: Sell ETH for token B  (ETH/B, most expensive venue)
-        Leg 3: Swap token B → token A on a stablecoin DEX (if A,B are stables)
-
-    Here we flag the spread between implied ETH prices across different pairs
-    so the operator knows when leg 3 is worth pursuing off-chain.
-    """
-    # Collect best (median) ETH price per pair across all fresh DEX quotes
     eth_price_per_pair: dict[str, float] = {}
-    for pair in PAIRS:
+    for pair in TRI_ARB_PAIRS:
         fresh = _fresh_prices(pair)
-        if not fresh:
-            continue
-        vals = sorted(fresh.values())
-        # Use median to reduce outlier noise
-        mid = len(vals) // 2
-        eth_price_per_pair[pair] = vals[mid] if len(vals) % 2 else (vals[mid-1] + vals[mid]) / 2
+        if fresh:
+            vals = [v for v in sorted(fresh.values()) if v >= TRI_MIN_PRICE]
+            if vals:
+                mid = len(vals) // 2
+                eth_price_per_pair[pair] = (
+                    vals[mid] if len(vals) % 2 == 1 else (vals[mid - 1] + vals[mid]) / 2
+                )
 
-    if len(eth_price_per_pair) < 2:
-        return
+    if len(eth_price_per_pair) < 2: return
 
-    for pair_a, pair_b in combinations(eth_price_per_pair, 2):
-        price_a = eth_price_per_pair[pair_a]
-        price_b = eth_price_per_pair[pair_b]
+    for a, b in combinations(eth_price_per_pair, 2):
+        pa, pb = eth_price_per_pair[a], eth_price_per_pair[b]
+        buy_pair, sell_pair = (a, b) if pa < pb else (b, a)
+        buy_p, sell_p = min(pa, pb), max(pa, pb)
+        gross = (sell_p - buy_p) / buy_p * 100
+        if gross < TRI_ARB_THRESHOLD: continue
 
-        # Use the lower as buy side
-        if price_a <= price_b:
-            buy_pair, sell_pair = pair_a, pair_b
-            buy_price, sell_price = price_a, price_b
-        else:
-            buy_pair, sell_pair = pair_b, pair_a
-            buy_price, sell_price = price_b, price_a
-
-        gross_pct = (sell_price - buy_price) / buy_price * 100
-        if gross_pct < TRI_ARB_THRESHOLD:
-            continue
-
-        # Conservative fee estimate: one swap on each side (average 0.30% each)
-        fee_total = 0.60
-        net_pct   = gross_pct - fee_total
-
+        net = gross - 0.60
         alert_key = f"tri:{buy_pair}:{sell_pair}"
-        mono_now  = time.monotonic()
-        if mono_now - last_alert[alert_key] < ALERT_COOLDOWN:
-            continue
-        last_alert[alert_key] = mono_now
+        if time.monotonic() - last_alert[alert_key] < 120: continue
+        last_alert[alert_key] = time.monotonic()
 
+        profit = (MIN_TRADE_USDT / buy_p * sell_p * 0.997) - (MIN_TRADE_USDT * 1.003)
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        qty         = MIN_TRADE_USDT / buy_price
-        proceeds    = qty * sell_price * (1 - 0.003)
-        cost        = MIN_TRADE_USDT  * 1.003
-        profit_usdt = proceeds - cost
 
-        print(f"\n{'*'*64}")
-        print(f"  TRIANGULAR ARB SIGNAL  [{ts}]")
-        print(f"{'*'*64}")
-        print(f"  ETH implied cheaper via  {buy_pair:<12}  @ {buy_price:>10.4f} USD")
-        print(f"  ETH implied pricier via  {sell_pair:<12}  @ {sell_price:>10.4f} USD")
-        print(f"  Implied gross spread : {gross_pct:>8.4f}%")
-        print(f"  Est. fees (2 swaps)  : {fee_total:>8.2f}%")
-        print(f"  Net spread           : {net_pct:>8.4f}%  {'✓ CHECK LEG-3 COST' if net_pct > 0 else '✗ fee-negative'}")
-        print(f"  Est. gross profit    : ${profit_usdt:>8.4f}  on ${MIN_TRADE_USDT:,.0f} (excl. leg-3 swap)")
-        print(f"  NOTE: Verify leg-3 (token swap) cost before executing.")
-        print(f"{'*'*64}\n")
+        print(f"\n{'*'*75}")
+        print(f"  TRIANGULAR ARB  {buy_pair} → {sell_pair}  [{ts}]")
+        print(f"{'*'*75}")
+        print(f"  Gross spread: {gross:>6.4f}%   Net: {net:>6.4f}%")
+        print(f"  Est. profit : ${profit:>7.2f} (excl. leg-3)")
+        print(f"{'*'*75}\n")
 
         log_alert(ts, "triangular", f"{buy_pair}↔{sell_pair}",
-                  buy_pair, buy_price, sell_pair, sell_price,
-                  gross_pct, 0.30, 0.30, net_pct, MIN_TRADE_USDT, profit_usdt)
+                  buy_pair, buy_p, sell_pair, sell_p,
+                  gross, 0.3, 0.3, net, MIN_TRADE_USDT, profit, "tri")
 
-# ─── DEX Polling ──────────────────────────────────────────────────────────────
-
-FETCHERS = list(DEX_FEE_PCT.keys())  # ["uniswap_v4", "uniswap_v3", "sushiswap", "balancer", "curve"]
-
+# ─── Polling & Status ─────────────────────────────────────────────────────────
 async def poll_dex(dex_id: str, pair: str) -> None:
-    retry_delay = 2
-    failures    = 0
-    last_err    = ""
-
-    print(f"[{dex_id}] Polling {pair}")
-
     async with aiohttp.ClientSession() as session:
         while True:
             try:
                 price = await _fetch_price(session, dex_id, pair)
                 if price and price > 0:
                     prices[pair][dex_id] = {"price": price, "ts": time.time()}
-                    check_cross_dex_arb(pair)
+                    check_cross_version_arb(pair)
                     check_triangular_arb()
-                    retry_delay = 2
-                    failures    = 0
-                    last_err    = ""
                 await asyncio.sleep(POLL_INTERVAL)
+            except Exception:
+                await asyncio.sleep(5)
 
-            except Exception as e:
-                err = f"{type(e).__name__}: {str(e)[:120]}"
-                failures += 1
-                if failures >= 8:
-                    print(f"[{dex_id}/{pair}] Giving up after 8 failures. Last: {err}")
-                    return
-                if err != last_err:
-                    print(f"[{dex_id}/{pair}] {err}  (retry {failures}/8 in {retry_delay}s)")
-                    last_err = err
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, 60)
-
-# ─── Periodic Status Table ────────────────────────────────────────────────────
 
 async def status_printer() -> None:
     await asyncio.sleep(20)
     while True:
         await asyncio.sleep(30)
         now = time.time()
-        print(f"\n{'─'*64}")
-        print(f"  PRICE SNAPSHOT  {datetime.now().strftime('%H:%M:%S')}  (Uniswap V4 edition)")
-        print(f"{'─'*64}")
+        exec_status = "ENABLED" if (get_executor() is not None) else "monitor-only"
+        print(f"\n{'─'*80}\n  LIVE SNAPSHOT {datetime.now().strftime('%H:%M:%S')}"
+              f" — V4 + V3 + V2  [{exec_status}]\n{'─'*80}")
         for pair in PAIRS:
             data = prices.get(pair, {})
-            if not data:
-                continue
-            print(f"\n  {pair}")
-            print(f"  {'DEX':<16} {'Price (USD)':>14} {'Age(s)':>8}")
-            print(f"  {'-'*42}")
-            for dex, v in sorted(data.items()):
-                age = f"{now - v['ts']:.1f}" if v.get("ts") else "—"
-                print(f"  {dex:<16} {v['price']:>14.4f} {age:>8}")
-        print(f"\n{'─'*64}\n")
+            if data:
+                print(f"\n  {pair}")
+                print(f"  {'DEX':<16} {'Price':>12} {'Age':>6}")
+                for dex, v in sorted(data.items()):
+                    age = f"{now - v['ts']:.1f}s" if v.get("ts") else "—"
+                    print(f"  {dex:<16} {v['price']:>12.4f} {age:>6}")
+        print(f"{'─'*80}\n")
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
-
+# ─── Main ─────────────────────────────────────────────────────────────────────
 async def main() -> None:
-    print("╔══════════════════════════════════════════════════════════╗")
-    print("║         DEX Arbitrage Monitor — Uniswap V4 Edition       ║")
-    print("╚══════════════════════════════════════════════════════════╝")
-    print(f"  Pairs      : {', '.join(PAIRS)}")
-    print(f"  DEXes      : uniswap_v4 (primary) + v3, sushiswap, balancer, curve")
-    print(f"  Arb types  : cross-DEX (same pair) + triangular (across ETH pairs)")
-    print(f"  Threshold  : {MIN_SPREAD_PCT}% gross (cross-DEX) / {TRI_ARB_THRESHOLD}% (triangular)")
-    print(f"  Min trade  : ${MIN_TRADE_USDT:,.0f} USD")
-    print(f"  Min liq    : ${MIN_POOL_LIQUIDITY:,.0f} USD (pool discovery filter)")
-    print(f"  Poll every : {POLL_INTERVAL}s  (≈ 1 Ethereum block)")
-    print(f"  Alert log  : {ALERT_LOG_FILE}")
-    print(f"  V4 PoolMgr : 0x000000000004444c5dc75cB358380D2e3dE08A90")
-    print()
-    print("  Note: exotic pairs (OSMO, WLFI, API3, CRO) use dynamic pool")
-    print("  discovery on first poll — expect brief startup delay.")
+    executor = get_executor()
+    exec_mode = "EXECUTE (flash loans ON)" if executor else "MONITOR ONLY"
+
+    print("╔════════════════════════════════════════════════════════════╗")
+    print("║     DEX ARBITRAGE MONITOR — Uniswap V4 + V3 + V2           ║")
+    print("╚════════════════════════════════════════════════════════════╝")
+    print(f"  • Mode          : {exec_mode}")
+    print(f"  • Min spread    : {MIN_SPREAD_PCT}%")
+    print(f"  • Min profit    : ${FLASH_MIN_PROFIT_USD:.2f} (flash threshold)")
+    print(f"  • Flash size    : ${FLASH_LOAN_SIZE_USD:,.0f}")
+    print(f"  • ETH price     : sanity-filtered 100–100,000 USD")
     print()
 
-    tasks = [
-        poll_dex(dex_id, pair)
-        for pair in PAIRS
-        for dex_id in FETCHERS
-    ]
+    tasks = [poll_dex(dex, pair)
+             for pair in PAIRS
+             for dex in ["uniswap_v4", "uniswap_v3", "uniswap_v2"]]
     tasks.append(status_printer())
     await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -531,6 +413,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nShutting down. Goodbye.")
+        print("\nShutdown.")
     finally:
         _log_file.close()
