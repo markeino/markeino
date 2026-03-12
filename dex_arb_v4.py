@@ -141,6 +141,13 @@ MIN_POOL_LIQUIDITY   = 50_000  # USD — minimum liquidity to flag arb alerts
 DISCOVERY_MIN_LIQ    = 5_000   # USD — lower bar just for pool address discovery
 ALERT_LOG_FILE       = "dex_arb_v4_alerts.csv"
 TRI_ARB_THRESHOLD    = 0.10    # min gross spread for triangular arb (%)
+TRI_ARB_COOLDOWN     = 120     # seconds between triangular arb alerts (per pair combo)
+
+# Only USD-stablecoin-quoted pairs express ETH price in comparable USD units.
+# Non-stablecoin pairs (WBTC, LINK, etc.) return exchange rates, not USD prices,
+# so mixing them into triangular arb produces meaningless spreads.
+TRI_ARB_PAIRS  = {"ETH/USDC", "ETH/USDT", "ETH/DAI"}
+TRI_MIN_PRICE  = 100.0        # USD — sanity filter, skip near-zero prices
 
 # ─── Alert Log ────────────────────────────────────────────────────────────────
 _log_file = open(ALERT_LOG_FILE, "a", newline="", buffering=1)
@@ -410,27 +417,24 @@ def check_cross_dex_arb(pair: str) -> None:
 
 def check_triangular_arb() -> None:
     """
-    Triangular arbitrage across ETH-denominated pairs.
+    Triangular arbitrage across ETH/stablecoin pairs only.
 
-    All pairs share ETH as the base; each quote token has an implied USD price
-    via the ETH/quote rate. If ETH appears cheaper in one quote currency vs
-    another, a round-trip trade can be profitable:
+    Only USDC, USDT, and DAI quotes express ETH price in comparable USD units.
+    Non-stablecoin pairs (WBTC, LINK, …) return token exchange rates whose
+    magnitude is incompatible — including them produces phantom billion-% spreads.
 
-        Leg 1: Buy ETH with token A  (ETH/A, cheapest venue)
-        Leg 2: Sell ETH for token B  (ETH/B, most expensive venue)
-        Leg 3: Swap token B → token A on a stablecoin DEX (if A,B are stables)
-
-    Here we flag the spread between implied ETH prices across different pairs
-    so the operator knows when leg 3 is worth pursuing off-chain.
+        Leg 1: Buy ETH with stablecoin A  (cheapest implied ETH price)
+        Leg 2: Sell ETH for stablecoin B  (priciest implied ETH price)
+        Leg 3: Swap B → A  (near-free on Curve/3pool; verify before executing)
     """
-    # Collect best (median) ETH price per pair across all fresh DEX quotes
     eth_price_per_pair: dict[str, float] = {}
-    for pair in PAIRS:
+    for pair in TRI_ARB_PAIRS:           # ← stablecoin pairs only
         fresh = _fresh_prices(pair)
         if not fresh:
             continue
-        vals = sorted(fresh.values())
-        # Use median to reduce outlier noise
+        vals = [v for v in sorted(fresh.values()) if v >= TRI_MIN_PRICE]
+        if not vals:
+            continue
         mid = len(vals) // 2
         eth_price_per_pair[pair] = vals[mid] if len(vals) % 2 else (vals[mid-1] + vals[mid]) / 2
 
@@ -459,7 +463,7 @@ def check_triangular_arb() -> None:
 
         alert_key = f"tri:{buy_pair}:{sell_pair}"
         mono_now  = time.monotonic()
-        if mono_now - last_alert[alert_key] < ALERT_COOLDOWN:
+        if mono_now - last_alert[alert_key] < TRI_ARB_COOLDOWN:
             continue
         last_alert[alert_key] = mono_now
 
