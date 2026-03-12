@@ -54,10 +54,12 @@ TOKEN_ADDRESSES: dict[str, str] = {
 # V4 fee tiers (bps): 100 (0.01%), 500 (0.05%), 3000 (0.30%), 10000 (1.00%)
 #   Hooks can set fully custom/dynamic fees — we default to 0.30% when unknown.
 
-# DexScreener dexId substrings for each logical DEX
+# DexScreener dexId substrings for each logical DEX.
+# DexScreener may use "uniswap_v4", "uniswap-v4", or just "uniswap" with a
+# version field — cast a wide net and include all observed variants.
 _DEXSCREENER_ID_MAP: dict[str, list[str]] = {
-    "uniswap_v4": ["uniswap_v4", "uniswap-v4"],
-    "uniswap_v3": ["uniswap_v3", "uniswap-v3"],
+    "uniswap_v4": ["uniswap_v4", "uniswap-v4", "uniswapv4"],
+    "uniswap_v3": ["uniswap_v3", "uniswap-v3", "uniswapv3"],
 }
 
 # Default LP swap fee (%)
@@ -106,7 +108,8 @@ MIN_TRADE_USDT       = 1_000.0 # notional trade size for P&L estimate
 POLL_INTERVAL        = 12      # seconds (≈ 1 Ethereum block)
 MAX_QUOTE_AGE        = 60.0    # discard quotes older than this
 STALE_LOG_EVERY      = 30.0    # rate-limit stale-quote warnings
-MIN_POOL_LIQUIDITY   = 50_000  # USD — skip pools below this
+MIN_POOL_LIQUIDITY   = 50_000  # USD — minimum liquidity to flag arb alerts
+DISCOVERY_MIN_LIQ    = 5_000   # USD — lower bar just for pool address discovery
 ALERT_LOG_FILE       = "dex_arb_v4_alerts.csv"
 TRI_ARB_THRESHOLD    = 0.10    # min gross spread for triangular arb (%)
 
@@ -159,15 +162,48 @@ def _pair_matches(pair_data: dict, base: str, quote: str) -> bool:
     q  = _normalize_symbol(quote)
     return (bt == b and qt == q) or (bt == q and qt == b)
 
+def _score_pool(p: dict, base: str, quote: str, dex_id: str) -> float | None:
+    """
+    Return liquidity USD if pool matches chain/dex/pair, else None.
+    Uses DISCOVERY_MIN_LIQ (lower bar) so we find pools even for exotic tokens.
+    """
+    if p.get("chainId") != "ethereum":
+        return None
+    if not _dex_matches(p.get("dexId", ""), dex_id):
+        return None
+    if not _pair_matches(p, base, quote):
+        return None
+    liq = (p.get("liquidity") or {}).get("usd", 0) or 0
+    return liq if liq >= DISCOVERY_MIN_LIQ else None
+
+
+async def _query_dexscreener(
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout: aiohttp.ClientTimeout,
+) -> list[dict]:
+    try:
+        async with session.get(url, timeout=timeout) as r:
+            data = await r.json(content_type=None)
+        return data.get("pairs") or []
+    except Exception:
+        return []
+
+
 async def _discover_pool(
     session: aiohttp.ClientSession,
     dex_id: str,
     pair: str,
 ) -> str | None:
     """
-    Search DexScreener for the highest-liquidity pool matching `pair` on `dex_id`.
-    Returns the pool address string or None if not found.
-    Caches results (including negative results) for the session lifetime.
+    Find the highest-liquidity pool for `pair` on `dex_id`.
+
+    Strategy (in order):
+      1. Token-address endpoint for the quote token (most reliable — returns
+         every pool containing that token, regardless of naming conventions)
+      2. Text search fallback for tokens without known addresses (OSMO, WLFI)
+
+    Results (including None) are cached for the session lifetime.
     """
     cache_key = (dex_id, pair)
     async with _pool_cache_lock:
@@ -175,34 +211,36 @@ async def _discover_pool(
             return _pool_cache[cache_key]
 
     base, quote = pair.split("/")
-    # Try both symbol orderings in the search query
-    queries = [f"{base} {quote}", f"W{base} {quote}" if base == "ETH" else f"{base} {quote}"]
+    timeout = aiohttp.ClientTimeout(total=10)
 
     best_address: str | None = None
     best_liquidity: float = 0.0
 
-    timeout = aiohttp.ClientTimeout(total=10)
-    for query in set(queries):
-        url = _DS_SEARCH_URL.format(query)
-        try:
-            async with session.get(url, timeout=timeout) as r:
-                data = await r.json(content_type=None)
-        except Exception:
-            continue
-
-        for p in data.get("pairs") or []:
-            if p.get("chainId") != "ethereum":
-                continue
-            if not _dex_matches(p.get("dexId", ""), dex_id):
-                continue
-            if not _pair_matches(p, base, quote):
-                continue
-            liq = (p.get("liquidity") or {}).get("usd", 0) or 0
-            if liq < MIN_POOL_LIQUIDITY:
-                continue
-            if liq > best_liquidity:
+    def _check_candidates(candidates: list[dict]) -> None:
+        nonlocal best_address, best_liquidity
+        for p in candidates:
+            liq = _score_pool(p, base, quote, dex_id)
+            if liq is not None and liq > best_liquidity:
                 best_liquidity = liq
                 best_address = p.get("pairAddress")
+
+    # ── Strategy 1: token address endpoint ────────────────────────────────────
+    quote_addr = TOKEN_ADDRESSES.get(quote)
+    weth_addr  = TOKEN_ADDRESSES["WETH"]
+    if quote_addr:
+        # Query both individual token endpoints; DexScreener returns all pools
+        # containing that token, making dex/pair filtering reliable.
+        for addr in {quote_addr, weth_addr}:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{addr}"
+            _check_candidates(await _query_dexscreener(session, url, timeout))
+            if best_address:
+                break  # found a match, no need to query WETH endpoint too
+
+    # ── Strategy 2: text search (unknown-address tokens: OSMO, WLFI, …) ──────
+    if not best_address:
+        for query in {f"WETH {quote}", f"{base} {quote}"}:
+            url = _DS_SEARCH_URL.format(query)
+            _check_candidates(await _query_dexscreener(session, url, timeout))
 
     async with _pool_cache_lock:
         _pool_cache[cache_key] = best_address
