@@ -1,17 +1,14 @@
 """
-DEX Arbitrage Monitor — Uniswap V4 Edition
-===========================================
-Monitors ETH/{DAI, OSMO, CRO, WLFI, API3, USDT} across Uniswap V4, V3,
-SushiSwap, Balancer, and Curve via the DexScreener REST API.
+DEX Arbitrage Monitor — Uniswap V4 / V3 Only
+=============================================
+Monitors ETH/{DAI, OSMO, CRO, WLFI, API3, USDT} exclusively across
+Uniswap V4 and Uniswap V3 via the DexScreener REST API.
 
-Key upgrades over V3 edition:
-  • Uniswap V4 added as primary DEX (singleton PoolManager, hook-aware fees)
-  • Dynamic pool discovery for exotic pairs (OSMO, WLFI, API3, CRO) that may
-    lack hardcoded addresses — searches DexScreener, picks highest-liquidity
-    pool, caches result for the session
-  • Cross-pair triangular-arb detector: spots ETH-leg imbalances across pairs
-    (e.g. DAI cheap vs USDT → buy ETH/DAI, sell ETH/USDT)
-  • Minimum-liquidity filter guards against thin/illiquid pools
+  • V4 is the primary venue (singleton PoolManager, hook-aware fees)
+  • V3 acts as a fallback / comparison leg for pairs not yet migrated to V4
+  • Dynamic pool discovery for exotic pairs (OSMO, WLFI, API3, CRO)
+  • Cross-pair triangular-arb detector across all ETH-denominated pairs
+  • Minimum-liquidity filter ($50k USD) guards against thin pools
 
 Ethereum block time ≈ 12 s → poll interval matches one block.
 No WebSocket needed; DexScreener REST is sufficient.
@@ -59,20 +56,14 @@ TOKEN_ADDRESSES: dict[str, str] = {
 
 # DexScreener dexId substrings for each logical DEX
 _DEXSCREENER_ID_MAP: dict[str, list[str]] = {
-    "uniswap_v4":  ["uniswap_v4", "uniswap-v4"],
-    "uniswap_v3":  ["uniswap_v3", "uniswap-v3"],
-    "sushiswap":   ["sushiswap", "sushi"],
-    "balancer":    ["balancer"],
-    "curve":       ["curve"],
+    "uniswap_v4": ["uniswap_v4", "uniswap-v4"],
+    "uniswap_v3": ["uniswap_v3", "uniswap-v3"],
 }
 
 # Default LP swap fee (%)
 DEX_FEE_PCT: dict[str, float] = {
-    "uniswap_v4":  0.30,   # typical 30-bps pool; hook fees excluded
-    "uniswap_v3":  0.30,
-    "sushiswap":   0.30,
-    "balancer":    0.10,
-    "curve":       0.04,
+    "uniswap_v4": 0.30,   # typical 30-bps pool; hook fees excluded
+    "uniswap_v3": 0.30,
 }
 
 # Per-pair fee overrides (well-known tight-fee pools)
@@ -85,10 +76,6 @@ _DEX_PAIR_FEE: dict[str, dict[str, float]] = {
         "ETH/DAI":  0.05,
         "ETH/USDT": 0.05,
     },
-    "curve": {
-        "ETH/DAI":  0.04,
-        "ETH/USDT": 0.04,
-    },
 }
 
 def get_fee(dex: str, pair: str) -> float:
@@ -100,21 +87,12 @@ def get_fee(dex: str, pair: str) -> float:
 # exposes them via an internal pair-address that can be queried normally.
 
 _KNOWN_POOLS: dict[str, dict[str, str]] = {
-    # --- Uniswap V3 (fallback for V4 pairs not yet migrated) ---
+    # --- Uniswap V3 (fallback / comparison for pairs not yet on V4) ---
     "uniswap_v3": {
         "ETH/DAI":  "0x60594a405d53811d3bc4766596efd80fd545a270",  # 0.05%
         "ETH/USDT": "0x11b815efb8f581194ae79006d24e0d814b7697f6",  # 0.05%
     },
-    # --- SushiSwap V2 ---
-    "sushiswap": {
-        "ETH/DAI":  "0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f",
-        "ETH/USDT": "0x06da0fd433c1a5d7a4faa01111c044910a184553",
-    },
-    # --- Curve TriCrypto (ETH/USDT shares pool with WBTC) ---
-    "curve": {
-        "ETH/USDT": "0xd51a44d3fae010294c616388b506acda1bfaae46",
-        "ETH/DAI":  "0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7",  # 3pool (DAI/USDC/USDT)
-    },
+    # V4 pools are discovered dynamically (no fixed per-pool contract addresses)
 }
 
 # ─── DexScreener URLs ─────────────────────────────────────────────────────────
@@ -442,7 +420,7 @@ def check_triangular_arb() -> None:
 
 # ─── DEX Polling ──────────────────────────────────────────────────────────────
 
-FETCHERS = list(DEX_FEE_PCT.keys())  # ["uniswap_v4", "uniswap_v3", "sushiswap", "balancer", "curve"]
+FETCHERS = list(DEX_FEE_PCT.keys())  # ["uniswap_v4", "uniswap_v3"]
 
 async def poll_dex(dex_id: str, pair: str) -> None:
     retry_delay = 2
@@ -505,8 +483,8 @@ async def main() -> None:
     print("║         DEX Arbitrage Monitor — Uniswap V4 Edition       ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"  Pairs      : {', '.join(PAIRS)}")
-    print(f"  DEXes      : uniswap_v4 (primary) + v3, sushiswap, balancer, curve")
-    print(f"  Arb types  : cross-DEX (same pair) + triangular (across ETH pairs)")
+    print(f"  DEXes      : Uniswap V4 (primary) + Uniswap V3 (comparison/fallback)")
+    print(f"  Arb types  : cross-version (V4 vs V3) + triangular (across ETH pairs)")
     print(f"  Threshold  : {MIN_SPREAD_PCT}% gross (cross-DEX) / {TRI_ARB_THRESHOLD}% (triangular)")
     print(f"  Min trade  : ${MIN_TRADE_USDT:,.0f} USD")
     print(f"  Min liq    : ${MIN_POOL_LIQUIDITY:,.0f} USD (pool discovery filter)")
