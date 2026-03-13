@@ -1,0 +1,3 @@
+# Foundry dependencies are installed via `forge install`, not committed.
+# Run: forge install foundry-rs/forge-std --no-commit
+# after cloning.
